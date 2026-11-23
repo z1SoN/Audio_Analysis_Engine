@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- 这是桌面 App、MeasurementLab 和数值测试共用的类库。Audio 负责拿到样本，Dsp 负责计算，Models 约定输入输出，Storage 负责文件。 -->
+  <!-- 对 NAudio 的依赖用在设备与音频文件入口。给 Dsp 直接传入数组时，同一套算法也能在没有窗口的进程里运行。 -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ApxRemix.Core.Tests" />
+    <Compile Remove="Numerics\SequenceBinWorker*.cs" />
+    <Compile Remove="Numerics\SequenceX87Worker.cs;Numerics\SequenceFrameworkToneMath.cs" />
+    <None Include="$(IntermediateOutputPath)SequenceBinWorker.exe" Link="SequenceBinWorker.exe"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="'$(OS)' == 'Windows_NT'" />
+    <None Include="$(IntermediateOutputPath)SequenceDesktopWorker.exe" Link="SequenceDesktopWorker.exe"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="'$(OS)' == 'Windows_NT'" />
+    <None Include="$(IntermediateOutputPath)SequenceX87Worker.exe" Link="SequenceX87Worker.exe"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="'$(OS)' == 'Windows_NT'" />
+    <!-- NAudio 提供 Windows WASAPI 与 ASIO 真实声卡全双工 I/O 能力 -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+  <!-- 仅编译独立数值进程。Intel MKL 由运行机器提供，发布包不含 AP 的 DLL。 -->
+  <Target Name="BuildSequenceBinWorker" BeforeTargets="CoreCompile;GetCopyToOutputDirectoryItems;GetCopyToPublishDirectoryItems"
+          Inputs="Numerics\SequenceBinWorker.cs;Numerics\SequenceBinWorker.Transforms.cs;Numerics\SequenceBinWorker.ToneMath.cs;Numerics\SequenceFrameworkToneMath.cs;Numerics\SequenceBinWorker.Chirp.cs;Numerics\SequenceResponseKernel.cs;$(MSBuildProjectFullPath)" Outputs="$(IntermediateOutputPath)SequenceBinWorker.exe;$(IntermediateOutputPath)SequenceDesktopWorker.exe"
+          Condition="'$(OS)' == 'Windows_NT'">
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Exec Command="&quot;$(WINDIR)\Microsoft.NET\Framework\v4.0.30319\csc.exe&quot; /nologo /optimize+ /platform:x86 /unsafe /reference:&quot;$(WINDIR)\Microsoft.NET\Framework\v4.0.30319\System.Numerics.dll&quot; /out:&quot;$(IntermediateOutputPath)SequenceBinWorker.exe&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceBinWorker.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceBinWorker.Transforms.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceBinWorker.ToneMath.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceFrameworkToneMath.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceBinWorker.Chirp.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceResponseKernel.cs&quot;" />
+    <Exec Command="&quot;$(WINDIR)\Microsoft.NET\Framework\v4.0.30319\csc.exe&quot; /nologo /optimize+ /platform:x64 /define:DESKTOP_WORKSHEET /unsafe /reference:&quot;$(WINDIR)\Microsoft.NET\Framework\v4.0.30319\System.Numerics.dll&quot; /out:&quot;$(IntermediateOutputPath)SequenceDesktopWorker.exe&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceBinWorker.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceBinWorker.Transforms.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceBinWorker.ToneMath.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceFrameworkToneMath.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceBinWorker.Chirp.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceResponseKernel.cs&quot;" />
+  </Target>
+  <!-- 桌面 CLR 的 x86 JIT 使用 x87。这个进程只编译 C# 数学表达式，运行时由 Framework 提供。 -->
+  <Target Name="BuildSequenceX87Worker" BeforeTargets="CoreCompile;GetCopyToOutputDirectoryItems;GetCopyToPublishDirectoryItems"
+          Inputs="Numerics\SequenceX87Worker.cs;Numerics\SequenceFrameworkToneMath.cs;$(MSBuildProjectFullPath)" Outputs="$(IntermediateOutputPath)SequenceX87Worker.exe"
+          Condition="'$(OS)' == 'Windows_NT'">
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Exec Command="&quot;$(WINDIR)\Microsoft.NET\Framework\v4.0.30319\csc.exe&quot; /nologo /optimize+ /platform:x86 /reference:&quot;$(WINDIR)\Microsoft.NET\Framework\v4.0.30319\System.Numerics.dll&quot; /out:&quot;$(IntermediateOutputPath)SequenceX87Worker.exe&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceX87Worker.cs&quot; &quot;$(MSBuildProjectDirectory)\Numerics\SequenceFrameworkToneMath.cs&quot;" />
+  </Target>
+</Project>
