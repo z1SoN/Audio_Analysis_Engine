@@ -24,6 +24,25 @@ public static class TransferFunctionAnalyzer
     private static int GetHop(int fftSize, double overlap) =>
         Math.Max(128, (int)(fftSize * (1.0 - Math.Clamp(overlap, 0.0, 0.75))));
 
+    /// <summary>多通道传递函数分析（同一参考通道对多个测量通道独立执行 FRF 估计）。</summary>
+    public static TransferFunctionResult[] AnalyzeMultiChannel(
+        ReadOnlySpan<double> referenceSignal,
+        IReadOnlyList<double[]> measuredChannels,
+        int sampleRate,
+        TransferFunctionConfig config,
+        bool hasIndependentChannels = true,
+        string referenceRoutingDescription = "Ref → Multi-Ch",
+        CancellationToken cancellationToken = default)
+    {
+        var results = new TransferFunctionResult[measuredChannels.Count];
+        for (int ch = 0; ch < measuredChannels.Count; ch++)
+        {
+            results[ch] = Analyze(referenceSignal, measuredChannels[ch], sampleRate, config,
+                hasIndependentChannels, $"{referenceRoutingDescription} [Ch{ch + 1}]", cancellationToken);
+        }
+        return results;
+    }
+
     // 第一帧用 N 点，每增加一次平均只需再取 hop 点，M 帧共需 N+(M−1)hop。
     public static int RequiredSamples(TransferFunctionConfig config)
     {
