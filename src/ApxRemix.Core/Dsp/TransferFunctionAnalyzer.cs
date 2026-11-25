@@ -20,11 +20,11 @@ public static class TransferFunctionAnalyzer
     private static int ValidateLength(int n) => n >= 512 && FftEngine.BenchLengths.Contains(n) ? n :
         throw new ArgumentOutOfRangeException(nameof(n), "Unsupported transfer FFT length.");
 
-    // 邻窗重叠越多，每次新增样本越少。步进以样本表示，最少 128 点。
+    // 邻窗重叠越多，每次新增样本越少（支持最高 0.9375 = 15/16 重叠，对齐 APx500 Transfer Function）。步进最少 64 点。
     private static int GetHop(int fftSize, double overlap) =>
-        Math.Max(128, (int)(fftSize * (1.0 - Math.Clamp(overlap, 0.0, 0.75))));
+        Math.Max(64, (int)Math.Round(fftSize * (1.0 - Math.Clamp(overlap, 0.0, 0.9375))));
 
-    /// <summary>多通道传递函数分析（同一参考通道对多个测量通道独立执行 FRF 估计）。</summary>
+    /// <summary>多通道传递函数分析（同一参考通道对多个测量通道执行 FRF 估计，支持 RelativeToRef 与 RelativeToInputChannel 自动延时对齐）。</summary>
     public static TransferFunctionResult[] AnalyzeMultiChannel(
         ReadOnlySpan<double> referenceSignal,
         IReadOnlyList<double[]> measuredChannels,
@@ -32,13 +32,27 @@ public static class TransferFunctionAnalyzer
         TransferFunctionConfig config,
         bool hasIndependentChannels = true,
         string referenceRoutingDescription = "Ref → Multi-Ch",
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int alignChannelIndex = 0)
     {
         var results = new TransferFunctionResult[measuredChannels.Count];
+        int? sharedAlignLag = null;
+        if (config.AlignMode == TransferFunctionAlignMode.RelativeToInputChannel && measuredChannels.Count > 0)
+        {
+            int refIdx = Math.Clamp(alignChannelIndex, 0, measuredChannels.Count - 1);
+            int fftSize = ValidateLength(config.FftSize);
+            int len = Math.Min(referenceSignal.Length, measuredChannels[refIdx].Length);
+            if (len >= fftSize)
+            {
+                sharedAlignLag = config.ManualDelaySamples
+                    ?? EstimateCoarseLagSamples(referenceSignal[..len], measuredChannels[refIdx].AsSpan(0, len), Math.Min(len / 2, fftSize));
+            }
+        }
+
         for (int ch = 0; ch < measuredChannels.Count; ch++)
         {
-            results[ch] = Analyze(referenceSignal, measuredChannels[ch], sampleRate, config,
-                hasIndependentChannels, $"{referenceRoutingDescription} [Ch{ch + 1}]", cancellationToken);
+            results[ch] = AnalyzeCore(referenceSignal, measuredChannels[ch], sampleRate, config,
+                hasIndependentChannels, $"{referenceRoutingDescription} [Ch{ch + 1}]", sharedAlignLag, cancellationToken);
         }
         return results;
     }
@@ -56,7 +70,19 @@ public static class TransferFunctionAnalyzer
         int sampleRate,
         TransferFunctionConfig config,
         bool hasIndependentChannels = true,
-        string referenceRoutingDescription = "Ref → Meas", CancellationToken cancellationToken = default)
+        string referenceRoutingDescription = "Ref → Meas", CancellationToken cancellationToken = default) =>
+        AnalyzeCore(referenceSignal, measuredSignal, sampleRate, config, hasIndependentChannels,
+            referenceRoutingDescription, sharedAlignLag: null, cancellationToken);
+
+    private static TransferFunctionResult AnalyzeCore(
+        ReadOnlySpan<double> referenceSignal,
+        ReadOnlySpan<double> measuredSignal,
+        int sampleRate,
+        TransferFunctionConfig config,
+        bool hasIndependentChannels,
+        string referenceRoutingDescription,
+        int? sharedAlignLag,
+        CancellationToken cancellationToken)
     {
         // 传递函数需要参考与响应两路观测。若把同一路复制两次，大多数被激励频率都会呈现接近 1 的假传递函数。
         if (!hasIndependentChannels)
@@ -71,6 +97,32 @@ public static class TransferFunctionAnalyzer
 
         int len = Math.Min(referenceSignal.Length, measuredSignal.Length);
         int fftSize = ValidateLength(config.FftSize);
+
+        // APx TransferFunction AlignMode: 在 Welch 分窗前执行整样本延时预对齐，消除大延时导致的窗口错位与相干度下降。
+        // RelativeToInputChannel 时使用参考输入通道相对 Ref 的统一延时，保留通道间相对相位与群延时（Om.decompiled.cs:24192-24201）。
+        int appliedAlignShift = 0;
+        if (config.AlignMode != TransferFunctionAlignMode.None && len >= fftSize)
+        {
+            int estLag = sharedAlignLag
+                ?? config.ManualDelaySamples
+                ?? EstimateCoarseLagSamples(referenceSignal[..len], measuredSignal[..len], Math.Min(len / 2, fftSize));
+            if (Math.Abs(estLag) > 0 && len - Math.Abs(estLag) >= fftSize)
+            {
+                appliedAlignShift = estLag;
+                int alignedLen = len - Math.Abs(estLag);
+                if (estLag > 0)
+                {
+                    measuredSignal = measuredSignal.Slice(estLag, alignedLen);
+                    referenceSignal = referenceSignal.Slice(0, alignedLen);
+                }
+                else
+                {
+                    referenceSignal = referenceSignal.Slice(-estLag, alignedLen);
+                    measuredSignal = measuredSignal.Slice(0, alignedLen);
+                }
+                len = alignedLen;
+            }
+        }
         // 指定平均次数时，必须有足够的同步样本才能构成全部完整帧；未指定时至少要够一帧。
         if (config.Averages > 0 && len < RequiredSamples(config))
             return new TransferFunctionResult(false, $"等待 {RequiredSamples(config)} 点以完成所选 Welch 平均。",
@@ -103,7 +155,7 @@ public static class TransferFunctionAnalyzer
         bool hasValidOutput = measRmsDbfs >= config.MinReferencePowerDbfs;
 
         int hop = GetHop(fftSize, config.OverlapRatio);
-        int firstOffset = config.Averages > 0 ? len - RequiredSamples(config) : 0;
+        int maxFrames = config.Averages > 0 ? config.Averages : int.MaxValue;
         var window = FftEngine.CreateWindow(fftSize, config.WindowType);
 
         int halfLen = fftSize / 2 + 1;
@@ -116,8 +168,8 @@ public static class TransferFunctionAnalyzer
         var bufX = new Complex[fftSize];
         var bufY = new Complex[fftSize];
 
-        // 对同一时刻的两路信号取等长窗口、去各自均值、乘同一窗。只有这样，交叉谱保留的相位差才对应同一段数据。
-        for (int offset = firstOffset; offset + fftSize <= len; offset += hop)
+        // 对同一时刻的两路信号取等长窗口、去各自均值、乘同一窗。按前 N 帧顺序累积（对齐 APx TransferFunctionMeasurement）。
+        for (int offset = 0; offset + fftSize <= len && frameCount < maxFrames; offset += hop)
         {
             cancellationToken.ThrowIfCancellationRequested();
             double meanX = 0.0, meanY = 0.0;
@@ -342,8 +394,8 @@ public static class TransferFunctionAnalyzer
             if (frameCount >= 2 && meanCoh >= 0.25 && peakVal > 1e-6 && irCrest >= 5.0)
             {
                 hasValidDelay = true;
-                // 后半段的峰按负延时解释。先给出带符号的样本差，除以 Fs 并乘 1000 得毫秒。
-                delaySamples = peakIdx <= fftSize / 2 ? peakIdx : peakIdx - fftSize;
+                // 后半段的峰按负延时解释，并加回 AlignMode 预对齐扣除的整样本偏移以报告完整系统延时。
+                delaySamples = (peakIdx <= fftSize / 2 ? peakIdx : peakIdx - fftSize) + appliedAlignShift;
                 delayMs = delaySamples * 1000.0 / sampleRate;
             }
             else
@@ -363,8 +415,9 @@ public static class TransferFunctionAnalyzer
         var corr = new Complex[fftSize];
         double refEnergy = 0, inputEnergy = 0;
         double windowSum = window.Coefficients.Sum();
-        // 幅度谱按窗幅值归一，功率谱密度还要按采样率和窗能量归一。单边谱中直流和奈奎斯特频点没有镜像伙伴，权重不同。
-        double psdScale = frameCount * sampleRate * fftSize * window.NoisePowerGain;
+        // 幅度谱按窗幅值归一；功率谱密度使用 double 避免大帧数×采样率×FFT 整数溢出，
+        // 并按 APx TransferFunctionEstimate（WindowDescriptor.FftToPowerSpectrum + 数字通道 AES17 √2 标定 -> 2× 功率）换算。
+        double psdScale = (double)frameCount * sampleRate * fftSize * window.NoisePowerGain;
         // 正弦功率除以帧数后按窗和的平方校准。内部频格要合并两侧振幅，因而此处用 factor²；下方的功率密度仅用 factor。
         double ToneDb(double power, int factor) => power > 0
             ? 10 * Math.Log10(power / frameCount * factor * factor / (windowSum * windowSum)) : double.NegativeInfinity;
@@ -374,8 +427,8 @@ public static class TransferFunctionAnalyzer
             binFrequencies[k] = k * binHz;
             refFft[k] = ToneDb(sxx[k], factor);
             inputFft[k] = ToneDb(syy[k], factor);
-            refPsd[k] = factor * sxx[k] / psdScale;
-            inputPsd[k] = factor * syy[k] / psdScale;
+            refPsd[k] = 2.0 * factor * sxx[k] / psdScale;
+            inputPsd[k] = 2.0 * factor * syy[k] / psdScale;
             refEnergy += factor * sxx[k];
             inputEnergy += factor * syy[k];
             corr[k] = sxy[k];
@@ -410,5 +463,38 @@ public static class TransferFunctionAnalyzer
             HasValidDelay: hasValidDelay,
             OutputStatusNote: outputNote,
             ImpulseResponse: impulse, Spectra: spectra);
+    }
+
+    private static int EstimateCoarseLagSamples(ReadOnlySpan<double> reference, ReadOnlySpan<double> measured, int maxLag)
+    {
+        int n = Math.Min(reference.Length, measured.Length);
+        int fftLen = 1;
+        while (fftLen < n * 2 && fftLen < 65536) fftLen <<= 1;
+        int copyLen = Math.Min(n, fftLen / 2);
+        var x = new Complex[fftLen];
+        var y = new Complex[fftLen];
+        double meanX = 0, meanY = 0;
+        for (int i = 0; i < copyLen; i++) { meanX += reference[i]; meanY += measured[i]; }
+        meanX /= copyLen; meanY /= copyLen;
+        for (int i = 0; i < copyLen; i++)
+        {
+            x[i] = new Complex(reference[i] - meanX, 0);
+            y[i] = new Complex(measured[i] - meanY, 0);
+        }
+        FftEngine.ForwardInPlace(x);
+        FftEngine.ForwardInPlace(y);
+        for (int i = 0; i < fftLen; i++) x[i] = y[i] * Complex.Conjugate(x[i]);
+        FftEngine.InverseInPlace(x);
+
+        int limit = Math.Min(maxLag, fftLen / 2 - 1);
+        int bestLag = 0;
+        double bestMag = -1.0;
+        for (int lag = -limit; lag <= limit; lag++)
+        {
+            int idx = (lag + fftLen) % fftLen;
+            double v = Math.Abs(x[idx].Real);
+            if (v > bestMag) { bestMag = v; bestLag = lag; }
+        }
+        return bestLag;
     }
 }

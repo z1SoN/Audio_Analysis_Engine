@@ -5,6 +5,104 @@ namespace ApxRemix.Core.Dsp;
 
 public static class ChirpCrosstalk
 {
+    /// <summary>
+    /// 对齐 APx500 <c>ChirpParams.OPPE837xSG</c>：
+    /// 在居中冲激响应中围绕错开通道的串扰峰截取 ±1 ms（<c>2·⌊Fs/1000⌋</c> 样本），
+    /// 拟合 5 阶多项式扣除平滑基底后分离带内串扰脉冲，并将基底与带外高频残余写回原冲激响应，
+    /// 使直通通道保持完整线性窗长而不被串扰峰截短。
+    /// </summary>
+    internal static double[]? ExciseStaggeredImpulse(double[] centeredIr, int directPeak, int offsetSamples, int sampleRate, double stopHz)
+    {
+        if (offsetSamples == 0 || sampleRate <= 0) return null;
+        int halfWidth = Math.Max(8, (int)Math.Floor(sampleRate / 1000.0));
+        int len = halfWidth * 2;
+        int start = directPeak + offsetSamples - halfWidth;
+        if (start < 0 || start + len > centeredIr.Length) return null;
+
+        var slice = new double[len];
+        Array.Copy(centeredIr, start, slice, 0, len);
+        var poly = ChirpResultMath.FitPolynomial5(slice);
+        var detrended = new double[len];
+        for (int i = 0; i < len; i++) detrended[i] = slice[i] - poly[i];
+
+        // 带外高频保留并叠加回多项式基底，仅切除扫频通带内的串扰脉冲能量
+        var spec = new Complex[len];
+        for (int i = 0; i < len; i++) spec[i] = new Complex(detrended[i], 0.0);
+        SequenceTransform.Forward(spec);
+
+        int f2Bin = (int)Math.Ceiling(stopHz / sampleRate * len);
+        int zeroBins = Math.Clamp((int)Math.Min(Math.Floor(0.8 * f2Bin), f2Bin - 5), 0, len / 2 + 1);
+        for (int k = 0; k < zeroBins; k++)
+        {
+            spec[k] = Complex.Zero;
+            if (k > 0 && k < len - k) spec[len - k] = Complex.Zero;
+        }
+        SequenceTransform.Inverse(spec);
+
+        for (int i = 0; i < len; i++)
+            centeredIr[start + i] = spec[i].Real + poly[i];
+
+        return detrended;
+    }
+
+    /// <summary>
+    /// 对齐 APx500 <c>ChirpParams.GetXtalkSum</c> 与 <c>ReprocessImpulseResults.ReprocessXtalk</c>：
+    /// 对切除出的串扰冲激切片施加 TrackPeak Equiripple 非对称窗并变换至 <c>harmFftLen</c>，
+    /// 与直通线性响应幅值逐频求比（自 max(1000 Hz, startHz) 至 stopHz）。
+    /// </summary>
+    internal static BenchTrace? FromExcisedImpulse(
+        double[] xtalkSlice,
+        Complex[] linearSpec,
+        int linFftLen,
+        int harmFftLen,
+        int sampleRate,
+        double startHz,
+        double stopHz)
+    {
+        if (xtalkSlice.Length < 4 || harmFftLen < 64) return null;
+        int peakInSlice = xtalkSlice.Length / 2;
+        int sliceStart = xtalkSlice.Length > harmFftLen
+            ? Math.Clamp(peakInSlice - harmFftLen / 2, 0, xtalkSlice.Length - harmFftLen)
+            : 0;
+        int used = Math.Min(xtalkSlice.Length, harmFftLen);
+        var asymWin = SequenceFrequencyResponse.CreateImpulseWindow(used, peakInSlice - sliceStart, 0.90, 0.95);
+
+        var buf = new Complex[harmFftLen];
+        for (int i = 0; i < used; i++)
+            buf[i] = new Complex(xtalkSlice[sliceStart + i] * asymWin[i], 0.0);
+        SequenceTransform.Forward(buf);
+
+        double minHz = Math.Max(1000.0, startHz);
+        int halfBins = harmFftLen / 2;
+        int firstBin = Math.Clamp((int)Math.Floor(minHz / sampleRate * harmFftLen), 1, halfBins);
+        int lastBin = Math.Clamp((int)Math.Ceiling(stopHz / sampleRate * harmFftLen), firstBin, halfBins);
+        int count = lastBin - firstBin + 1;
+        if (count <= 0) return null;
+
+        double harmDf = (double)sampleRate / harmFftLen;
+        double linDf = (double)sampleRate / linFftLen;
+        int linMaxBin = linFftLen / 2 - 1;
+        var freqs = new double[count];
+        var ratioDb = new double[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            int k = firstBin + i;
+            double hz = k * harmDf;
+            freqs[i] = hz;
+            double xtalkMag = buf[k].Magnitude;
+            double pos = Math.Clamp(hz / linDf, 1.0, linMaxBin);
+            int lo = (int)pos;
+            double fundMag = linearSpec[lo].Magnitude;
+            if (pos != lo && lo + 1 <= linMaxBin)
+                fundMag += (pos - lo) * (linearSpec[lo + 1].Magnitude - fundMag);
+            ratioDb[i] = double.IsFinite(fundMag) && fundMag > 1e-12
+                ? 20.0 * Math.Log10(Math.Max(xtalkMag / fundMag, 1e-15))
+                : double.NaN;
+        }
+        return new BenchTrace(freqs, ratioDb);
+    }
+
     public static BenchTrace FromStaggeredImpulse(double[] impulse, int directPeak, int offset, double[] frequencies, int sampleRate)
     {
         int radius = Math.Abs(offset) / 2;

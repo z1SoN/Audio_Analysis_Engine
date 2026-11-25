@@ -188,14 +188,18 @@ internal static partial class SequenceBinWorker
     // 桌面版本可指定 MKL 的线程数，让本工作进程按确定的线程设置执行。
     [DllImport(Mkl, CallingConvention = CallingConvention.Cdecl)]
     private static extern void MKL_Set_Num_Threads(int count);
+    private static bool desktopMklInitialized;
+
+    private static void InitializeDesktopMkl()
+    {
+        if (desktopMklInitialized) return;
+        MKL_Set_Num_Threads(1);
+        desktopMklInitialized = true;
+    }
 #endif
-    // 该程序以二进制标准输入输出常驻服务；桌面构建先将 MKL 线程数固定为一。
+    // 窗的纯标量路径不需要装入 MKL。首条库运算命令负责设置桌面线程数。
     public static void Main()
     {
-#if DESKTOP_WORKSHEET
-        // APx500 initializes MKL on the desktop UI host before starting the worksheet.
-        MKL_Set_Num_Threads(1);
-#endif
         using (var input=new BinaryReader(Console.OpenStandardInput()))
         using (var output=new BinaryWriter(Console.OpenStandardOutput()))
         {
@@ -204,6 +208,9 @@ internal static partial class SequenceBinWorker
                 // 文件结束表示客户端关闭。负数字段是操作码，非负字段则为本条测频消息的采样点数。
                 int n;
                 try { n=input.ReadInt32(); } catch (EndOfStreamException) { return; }
+#if DESKTOP_WORKSHEET
+                if (n != -5) InitializeDesktopMkl();
+#endif
                 if (n < 0)
                 {
                     TransformOperation(n, input, output);

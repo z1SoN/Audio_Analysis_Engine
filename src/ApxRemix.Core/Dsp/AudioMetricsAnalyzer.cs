@@ -139,6 +139,9 @@ public static class AudioMetricsAnalyzer
                 double wTau = 2.0 * Math.PI * frequencyHz * 75e-6;
                 return 1.0 / (1.0 + wTau * wTau);
             }
+            case AnalyzerWeighting.Ccitt:
+            case AnalyzerWeighting.CMessage:
+                return ApxAnsiWeighting.EvaluateAnalogPowerGain(frequencyHz, weighting);
             default:
                 return 1.0;
         }
@@ -150,6 +153,50 @@ public static class AudioMetricsAnalyzer
     {
         if (cutoffHz <= 0.0 || frequencyHz <= cutoffHz) return 1.0;
         return Math.Pow(cutoffHz / frequencyHz, 100.0);
+    }
+
+    /// <summary>计算 APxRT 8 阶 0.01 dB 纹波椭圆低通滤波器功率响应 |H(f)|²（与 <c>ApxEllipticLowPass</c> 同原型、同预畸变）。</summary>
+    public static double ComputeElliptic8LowpassPowerGain(double frequencyHz, double cutoffHz, int sampleRate = 0)
+    {
+        if (cutoffHz <= 0.0) return 1.0;
+        if (sampleRate > 0 && frequencyHz >= sampleRate * 0.5) return 0.0;
+        double u;
+        if (sampleRate > 0)
+        {
+            double rel = ApxEllipticLowPass.RelativeCutoff(cutoffHz, sampleRate);
+            double prewarped = Math.Tan(Math.PI * (0.5 * rel));
+            u = Math.Tan(Math.PI * frequencyHz / sampleRate) / prewarped;
+        }
+        else
+        {
+            u = frequencyHz / cutoffHz;
+        }
+
+        double u2 = u * u;
+        const double dcGainSq = 0.99942451938 * 0.99942451938;
+        ReadOnlySpan<(double Re, double Im, double ZIm)> sections =
+        [
+            (-0.050061961859382879, 1.0544010430691861, 1.2937938824069803),
+            (-0.17959150307597616, 0.98310522840240977, 1.4437942036807718),
+            (-0.38398300339739067, 0.77530916216000145, 1.9850289833081445),
+            (-0.60280069931460323, 0.31633913385572676, 5.2959231779150429)
+        ];
+
+        double pow = dcGainSq;
+        for (int i = 0; i < sections.Length; i++)
+        {
+            var (pRe, pIm, zIm) = sections[i];
+            double pRe2 = pRe * pRe;
+            double pMag2 = pRe2 + pIm * pIm;
+            double z2 = zIm * zIm;
+            double num = z2 - u2;
+            double d1 = u - pIm;
+            double d2 = u + pIm;
+            double den = (pRe2 + d1 * d1) * (pRe2 + d2 * d2);
+            double dcRatio = (pMag2 * pMag2) / (z2 * z2);
+            pow *= (num * num / den) * dcRatio;
+        }
+        return pow;
     }
 
     // 求某一 FFT 频点经倍频程带通后的功率比。Fs/2 及以上没有可独立表示的正频率，返回零。
@@ -201,12 +248,16 @@ public static class AudioMetricsAnalyzer
             gainSq /= 1.0 + Math.Pow(r, 8);
         }
 
-        // 八阶低通功率分母有十六次幂。选择 AES17 时改用该快照路径的陡降模型。
+        // 八阶低通功率分母有十六次幂。选择 AES17 或 Elliptic8 时分别走对应的陡降模型。
         if (lowPassHz > 0.0)
         {
             if (lowPassType == LowPassFilterType.Aes17)
             {
                 gainSq *= ComputeAes17LowpassPowerGain(frequencyHz, lowPassHz);
+            }
+            else if (lowPassType == LowPassFilterType.Elliptic8)
+            {
+                gainSq *= ComputeElliptic8LowpassPowerGain(frequencyHz, lowPassHz, sampleRate);
             }
             else
             {
@@ -397,10 +448,22 @@ public static class AudioMetricsAnalyzer
         if (filterConfig.HighPassHz > 0.0)
             ApplyButterworthInPlace(filtered, sampleRate, filterConfig.HighPassHz, order: 4, isHighPass: true);
 
-        // 八阶低通在时域执行，AES17 在后面的频域路径乘功率曲线，避免重复施加同一低通。
-        bool applyTimeDomainLp = filterConfig.LowPassHz > 0.0 && filterConfig.LowPassType == LowPassFilterType.Butterworth8;
+        // 八阶 Butterworth / Elliptic8 低通在时域执行，AES17 在后面的频域路径乘功率曲线，避免重复施加同一低通。
+        bool applyTimeDomainLp = filterConfig.LowPassHz > 0.0
+            && filterConfig.LowPassType is LowPassFilterType.Butterworth8 or LowPassFilterType.Elliptic8;
         if (applyTimeDomainLp)
-            ApplyButterworthInPlace(filtered, sampleRate, filterConfig.LowPassHz, order: 8, isHighPass: false);
+        {
+            if (filterConfig.LowPassType == LowPassFilterType.Elliptic8)
+            {
+                double rel = ApxEllipticLowPass.RelativeCutoff(filterConfig.LowPassHz, sampleRate);
+                var (ellipLp, _) = ApxEllipticLowPass.CreateStereo(rel, sampleRate);
+                ellipLp.ProcessInPlace(filtered);
+            }
+            else
+            {
+                ApplyButterworthInPlace(filtered, sampleRate, filterConfig.LowPassHz, order: 8, isHighPass: false);
+            }
+        }
 
         // 本次新建的高通或低通要经过启动过程，最多跳过首四分之一记录、上限 4096 点，再对余下部分测 RMS。
         int settleSkip = (filterConfig.HighPassHz > 0.0 || applyTimeDomainLp)
@@ -539,20 +602,21 @@ public static class AudioMetricsAnalyzer
         double powerScale = 4.0 / ((double)fftSize * fftSize * window.NoisePowerGain);
 
         // 每个目标频率合计主瓣附近若干格的功率。越出有效带的组合频率返回零，避免把折叠或无效频率当作产物。
-        double TonePower(double fHz, int halfSpanBins = 4)
+        double TonePowerFrom(Complex[] spec, double fHz, int halfSpanBins = 4)
         {
             if (fHz <= 5.0 || fHz >= sampleRate * 0.485) return 0.0;
             int center = (int)Math.Round(fHz / binHz);
             int lo = Math.Max(1, center - halfSpanBins);
-            int hi = Math.Min(halfSpec.Length - 2, center + halfSpanBins);
+            int hi = Math.Min(spec.Length - 2, center + halfSpanBins);
             double sum = 0.0;
             for (int k = lo; k <= hi; k++)
             {
-                double m = halfSpec[k].Magnitude;
+                double m = spec[k].Magnitude;
                 sum += m * m * powerScale;
             }
             return sum;
         }
+        double TonePower(double fHz, int halfSpanBins = 4) => TonePowerFrom(halfSpec, fHz, halfSpanBins);
 
         // 自动检测两个最强非相邻主峰（支持任意频率 SMPTE / CCIF / DFD 双音，对齐 APx500 PeakBin + PeakBin2）
         int minBin = Math.Max(2, (int)Math.Ceiling(20.0 / binHz));
@@ -605,6 +669,65 @@ public static class AudioMetricsAnalyzer
             double ratio = MeasureSmpteEnvelopeRatio(halfSpec, fftSize, sampleRate, fHigh);
             string lbl = $"SMPTE {fLow:F0}+{fHigh / 1000.0:0.#}k";
             return new ImdChannelResult(true, lbl, ratio * 100.0, 20.0 * Math.Log10(Math.Max(ratio, 1e-9)));
+        }
+        else if (resolved == ImdMeasurementStandard.Mod)
+        {
+            // APx500 IMDType.MOD (Mod.Compute / Dfd-helper): 时域扣除两个主载波后再作第二次 FFT 积分边带 fHigh ± k·fLow (k=1..4)，以高频载波功率为参考。
+            double pLow = TonePower(fLow);
+            double pHigh = TonePower(fHigh);
+            if (pLow < 1e-8 || pHigh < 1e-8 || fHigh / Math.Max(fLow, 1.0) < 2.5)
+                return new ImdChannelResult(false, "MOD", double.NaN, double.NaN, "Need low+high MOD tones");
+
+            var analysisSamples = samples[^fftSize..];
+            var fitLow = SineFit.Fit(analysisSamples, fLow / binHz, window.Coefficients, fixedFrequency: false);
+            var afterLow = fitLow.Residual(analysisSamples);
+            var fitHigh = SineFit.Fit(afterLow, fHigh / binHz, window.Coefficients, fixedFrequency: false);
+            var residual = fitHigh.Residual(afterLow);
+            var (_, _, resSpec, _) = FftEngine.ComputeSingleSidedSpectrum(residual, fftSize, FftWindowType.BlackmanHarris4, removeDcOffset: false);
+
+            double fLowExact = fitLow.FrequencyBins * binHz;
+            double fHighExact = fitHigh.FrequencyBins * binHz;
+
+            // APx500 IMDType.MOD (Mod.Compute): 成对边带按幅度相加（使 m% 调幅正弦的 d2 读数精确等于 m%），再按阶次 RSS 合成。
+            double d2Amp = Math.Sqrt(TonePowerFrom(resSpec, fHighExact - fLowExact)) + Math.Sqrt(TonePowerFrom(resSpec, fHighExact + fLowExact));
+            double d3Amp = Math.Sqrt(TonePowerFrom(resSpec, fHighExact - 2.0 * fLowExact)) + Math.Sqrt(TonePowerFrom(resSpec, fHighExact + 2.0 * fLowExact));
+            double d4Amp = Math.Sqrt(TonePowerFrom(resSpec, fHighExact - 3.0 * fLowExact)) + Math.Sqrt(TonePowerFrom(resSpec, fHighExact + 3.0 * fLowExact));
+            double d5Amp = Math.Sqrt(TonePowerFrom(resSpec, fHighExact - 4.0 * fLowExact)) + Math.Sqrt(TonePowerFrom(resSpec, fHighExact + 4.0 * fLowExact));
+            double imdPower = mode switch
+            {
+                ImdMeasurementMode.D2 => d2Amp * d2Amp,
+                ImdMeasurementMode.D3 => d3Amp * d3Amp,
+                ImdMeasurementMode.D23 => d2Amp * d2Amp + d3Amp * d3Amp,
+                ImdMeasurementMode.D25 => d2Amp * d2Amp + d3Amp * d3Amp + d4Amp * d4Amp + d5Amp * d5Amp,
+                _ => d2Amp * d2Amp + d3Amp * d3Amp
+            };
+            double ratio = Math.Sqrt(Math.Max(imdPower, 0.0) / pHigh);
+            string lbl = $"MOD {fLowExact:F0}+{fHighExact / 1000.0:0.#}k ({mode.ToString().ToLowerInvariant()})";
+            return new ImdChannelResult(true, lbl, ratio * 100.0, 20.0 * Math.Log10(Math.Max(ratio, 1e-15)));
+        }
+        else if (resolved == ImdMeasurementStandard.Iec60118)
+        {
+            // APx500 Imd.MeasureIec60118: Dfd.Compute([D2, D3minus]) * 2.0 (fHigh - fLow 与 2·fLow - fHigh，以高载波幅值为参考)
+            double pLow = TonePower(fLow);
+            double pHigh = TonePower(fHigh);
+            if (pLow < 1e-8 || pHigh < 1e-8)
+                return new ImdChannelResult(false, "IEC60118", double.NaN, double.NaN, "Need dual tones");
+
+            var analysisSamples = samples[^fftSize..];
+            var fitLow = SineFit.Fit(analysisSamples, fLow / binHz, window.Coefficients, fixedFrequency: false);
+            var afterLow = fitLow.Residual(analysisSamples);
+            var fitHigh = SineFit.Fit(afterLow, fHigh / binHz, window.Coefficients, fixedFrequency: false);
+            var residual = fitHigh.Residual(afterLow);
+            var (_, _, resSpec, _) = FftEngine.ComputeSingleSidedSpectrum(residual, fftSize, FftWindowType.BlackmanHarris4, removeDcOffset: false);
+
+            double fLowExact = fitLow.FrequencyBins * binHz;
+            double fHighExact = fitHigh.FrequencyBins * binHz;
+            double d2Pow = TonePowerFrom(resSpec, fHighExact - fLowExact);
+            double d3MinusPow = TonePowerFrom(resSpec, 2.0 * fLowExact - fHighExact);
+            double refAmp = Math.Sqrt(pHigh);
+            double ratio = Math.Sqrt(Math.Max(d2Pow + d3MinusPow, 0.0)) / Math.Max(refAmp, 1e-12);
+            string lbl = $"IEC60118 {fLowExact / 1000.0:0.#}+{fHighExact / 1000.0:0.#}k";
+            return new ImdChannelResult(true, lbl, ratio * 100.0, 20.0 * Math.Log10(Math.Max(ratio, 1e-15)));
         }
         else
         {
@@ -1403,3 +1526,4 @@ public static class AudioMetricsAnalyzer
         return size;
     }
 }
+

@@ -349,14 +349,24 @@ public enum AnalyzerWeighting
     Deemphasis75us,
     BWeighting,
     Deemphasis50usA,
-    Deemphasis75usA
+    Deemphasis75usA,
+    Ccitt,
+    CMessage
+}
+
+/// <summary>分析仪高通滤波器拓扑（对齐 APx500 HP4 Butterworth 与 HP5 Elliptic 高通）。</summary>
+public enum HighPassFilterType
+{
+    Butterworth4,
+    Elliptic5
 }
 
 /// <summary>分析仪低通滤波器拓扑（对齐 APx500 LP8 Butterworth 与 AES17 砖墙低通）。</summary>
 public enum LowPassFilterType
 {
     Butterworth8,
-    Aes17
+    Aes17,
+    Elliptic8
 }
 
 /// <summary>带通电平表选择性（对齐 APx500 6阶 Butterworth 1/3、1/6、1/12、1/24 倍频程带通）。</summary>
@@ -378,7 +388,9 @@ public enum ImdMeasurementStandard
     Smpte,
     Ccif,
     Dfd,
-    DimEmulation
+    DimEmulation,
+    Mod,
+    Iec60118
 }
 
 /// <summary>DFD / CCIF 互调产物阶次组合（对齐 APx500 IMDMode：d2 / d3 / d23 / d25）。</summary>
@@ -470,7 +482,8 @@ public enum FftWindowType
     Equiripple,
     Dolph150,
     Dolph200,
-    Dolph250
+    Dolph250,
+    NoneMoveToBinCenter
 }
 
 /// <summary>APx transfer function estimators.</summary>

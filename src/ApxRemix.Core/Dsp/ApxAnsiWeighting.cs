@@ -4,84 +4,181 @@ using ApxRemix.Core.Models;
 
 namespace ApxRemix.Core.Dsp;
 
+/// <summary>
+/// APxRT 10.0.0.17 实时计权与去加重滤波器完整复刻（覆盖全部 11 种 WtFilterType）。
+/// 对应 APxRT.c：AnsiWeightingFilter (100127e0/10013b70)、CcirFilter (10013590)、
+/// CCITTFilter (100128a0)、CMessageFilter (10013020)、DeemphasisFilter (10013a80)、
+/// DeemphasisAwtFilter (10013980) 及 IirFromAnalogProto 单形优化器 (1000ad90/100097b0/10011710)。
+/// </summary>
 internal static class ApxAnsiWeighting
 {
     private readonly record struct AnalogStage(double Pole1, double Pole2, int ZerosAtOrigin, double Imaginary = 0);
+    private readonly record struct PrototypeSpec(AnalogStage[] Stages, int FittedSections, double ReferenceHz, double OverallGain);
     private readonly record struct Design(StreamingIirCascade.BiquadCoeffs[] Sections, double Gain);
-    private readonly record struct Candidate(double B1, double B2, double Error);
+
     private static readonly ConcurrentDictionary<(int Rate, AnalyzerWeighting Weight), Design> Designs = new();
+
+    private static readonly AnalogStage AnsiHigh = new(-76618.52508695953, -76618.52508695953, 2);
+    private static readonly AnalogStage AnsiLow = new(-129.42731529303637, -129.42731529303637, 0);
+    private static readonly AnalogStage AnsiMidA = new(-4636.125122258764, -676.4015487589464, 2);
+    private static readonly AnalogStage AnsiMidB = new(-995.8848711879644, 0, 1);
+
+    private static PrototypeSpec? GetSpec(AnalyzerWeighting weighting) => weighting switch
+    {
+        AnalyzerWeighting.AWeighting => new([AnsiHigh, AnsiMidA, AnsiLow], 1, 1000.0, 1.0),
+        AnalyzerWeighting.BWeighting => new([AnsiHigh, AnsiMidB, AnsiLow], 1, 1000.0, 1.0),
+        AnalyzerWeighting.CWeighting => new([AnsiHigh, AnsiLow], 1, 1000.0, 1.0),
+        AnalyzerWeighting.Ccir1k => new(
+        [
+            new(-25903.701161964338, -62675.17014007283, 1),
+            new(-18743.746620223184, -18743.746620223184, 0, 62460.15671371604),
+            new(-23615.535228758155, -23615.535228758155, 0, 36379.90898596716)
+        ], 1, 1000.0, 1.0),
+        AnalyzerWeighting.Ccir2k => new(
+        [
+            new(-25903.701161964338, -62675.17014007283, 1),
+            new(-18743.746620223184, -18743.746620223184, 0, 62460.15671371604),
+            new(-23615.535228758155, -23615.535228758155, 0, 36379.90898596716)
+        ], 1, 2000.0, 1.0),
+        // APxRT 100128a0 CCITTFilter: 6 sections, 2 dynamically fitted numerators, ref = 800 Hz.
+        AnalyzerWeighting.Ccitt => new(
+        [
+            new(-4257.61235457667, -585.846148593471, 2),
+            new(-1125.81740971204, -1125.81740971204, 2, 1707.37194927851),
+            new(-2921.37811768207, -2921.37811768207, 0, 5845.69608723553),
+            new(-5282.91893850458, -5282.91893850458, 0, 14421.9191513711),
+            new(-3853.72378407296, -3853.72378407296, 0, 21107.1711110092),
+            new(-3788.88180907736, -3788.88180907736, 0, 26107.7485960876)
+        ], 2, 800.0, 1.0),
+        // APxRT 10013020 CMessageFilter: 4 sections, 1 dynamically fitted numerator, ref = 1000 Hz.
+        AnalyzerWeighting.CMessage => new(
+        [
+            new(-4017.0, -4017.0, 2, 21575.0),
+            new(-1502.0, -1502.0, 1, 1267.0),
+            new(-2439.0, -2439.0, 0, 5336.0),
+            new(-4690.0, -4690.0, 0, 15267.0)
+        ], 1, 1000.0, 1.0),
+        // APxRT 10013a80 DeemphasisFilter: 1 section, pole -1/tau, ref = 0 Hz (DC).
+        AnalyzerWeighting.Deemphasis50us => new([new(-1.0 / 50e-6, 0, 0)], 1, 0.0, 1.0),
+        AnalyzerWeighting.Deemphasis75us => new([new(-1.0 / 75e-6, 0, 0)], 1, 0.0, 1.0),
+        // APxRT 10013980 DeemphasisAwtFilter: 3 A-wt sections + 1 De-emphasis pole, ref = 1000 Hz, overall gain 0.9541 / 0.9047.
+        AnalyzerWeighting.Deemphasis50usA => new([AnsiHigh, AnsiMidA, AnsiLow, new(-1.0 / 50e-6, 0, 0)], 1, 1000.0, 0.9541),
+        AnalyzerWeighting.Deemphasis75usA => new([AnsiHigh, AnsiMidA, AnsiLow, new(-1.0 / 75e-6, 0, 0)], 1, 1000.0, 0.9047),
+        _ => null
+    };
 
     // 给每条信号通路创建独立的滤波状态。相同采样率和计权可以共用系数，不能共用某一声道的历史样本。
     internal static StreamingIirCascade Create(AnalyzerWeighting weighting, int sampleRate)
     {
-        // 此处专门设计 A/B/C 和两种 CCIR，其余选择交给通用计权级，包括去加重和直通。
-        if (weighting is not (AnalyzerWeighting.AWeighting or AnalyzerWeighting.BWeighting or AnalyzerWeighting.CWeighting
-            or AnalyzerWeighting.Ccir1k or AnalyzerWeighting.Ccir2k))
+        if (weighting == AnalyzerWeighting.Flat || sampleRate <= 0)
+            return StreamingIirCascade.Bypass();
+
+        var spec = GetSpec(weighting);
+        if (spec is null)
             return StreamingIirCascade.CreateWeightingFilter(weighting, sampleRate);
 
-        // Keep the result of the optimization, and give each channel its own filter state.
-        var design = Designs.GetOrAdd((sampleRate, weighting), static key => Calculate(key.Rate, key.Weight));
+        var design = Designs.GetOrAdd((sampleRate, weighting), static key => Calculate(key.Rate, GetSpec(key.Weight)!.Value));
         return new StreamingIirCascade(design.Sections, design.Gain, useApxStateOrder: true);
     }
 
-    // 目标是让数字滤波器在一系列频率上的相对功率跟随模拟原型。本方法只设计系数，并未送入声卡实测。
-    private static Design Calculate(int rate, AnalyzerWeighting weighting)
+    /// <summary>按 APxRT 模拟原型精确计算任意计权在指定频率处的归一化功率响应 |H(jω)|²。</summary>
+    internal static double EvaluateAnalogPowerGain(double frequencyHz, AnalyzerWeighting weighting)
     {
-        // APxRT 10.0.0.17 constructs these analog poles (rad/s) in 10013b70.
-        var high = new AnalogStage(-76618.52508695953, -76618.52508695953, 2);
-        var low = new AnalogStage(-129.42731529303637, -129.42731529303637, 0);
-        // 每节保存一个或两个模拟极点与原点零点数。切换 A/B/C 会改变低频滚降，CCIR 还含两对复极点。
-        AnalogStage[] prototype = weighting switch
+        if (weighting == AnalyzerWeighting.Flat) return 1.0;
+        var spec = GetSpec(weighting);
+        if (spec is null) return 1.0;
+        double refPow = EvaluateAnalogRawPower(spec.Value.Stages, spec.Value.ReferenceHz * Math.Tau);
+        if (refPow <= 0) return 0.0;
+        double pow = EvaluateAnalogRawPower(spec.Value.Stages, frequencyHz * Math.Tau);
+        double gainSq = spec.Value.OverallGain * spec.Value.OverallGain;
+        return (pow / refPow) * gainSq;
+    }
+
+    private static double EvaluateAnalogRawPower(AnalogStage[] stages, double omega)
+    {
+        var s = new Complex(0, omega);
+        Complex h = Complex.One;
+        foreach (var p in stages)
         {
-            AnalyzerWeighting.AWeighting => [high, new(-4636.125122258764, -676.4015487589464, 2), low],
-            AnalyzerWeighting.BWeighting => [high, new(-995.8848711879644, 0, 1), low],
-            AnalyzerWeighting.CWeighting => [high, low],
-            // CCIR and Dolby 2K use the same prototype (APxRT 10013590).
-            _ => [new(-25903.701161964338, -62675.17014007283, 1),
-                  new(-18743.746620223184, -18743.746620223184, 0, 62460.15671371604),
-                  new(-23615.535228758155, -23615.535228758155, 0, 36379.90898596716)]
-        };
+            Complex den = s - new Complex(p.Pole1, p.Imaginary);
+            if (p.Pole2 != 0) den *= s - new Complex(p.Pole2, -p.Imaginary);
+            Complex num = p.ZerosAtOrigin switch { 2 => s * s, 1 => s, _ => Complex.One };
+            h *= num / den;
+        }
+        return Power(h);
+    }
+
+    // 目标是让数字滤波器在一系列频率上的相对功率跟随模拟原型。
+    private static Design Calculate(int rate, PrototypeSpec spec)
+    {
+        var prototype = spec.Stages;
+        int fittedCount = spec.FittedSections;
+        int fixedCount = prototype.Length - fittedCount;
         var sections = new StreamingIirCascade.BiquadCoeffs[prototype.Length];
         double dt = 1d / rate;
-        // 一个模拟衰减模式在一个采样间隔 dt 后乘以 exp(p·dt)。虚部使该模式在衰减的同时旋转。
+
+        // 模拟极点按冲激不变映射 z = exp(p * dt)；前 fixedCount 节保留原点零点，后 fittedCount 节分子待优化。
         for (int i = 0; i < prototype.Length; i++)
         {
             var stage = prototype[i];
+            double a1, a2;
             if (stage.Imaginary != 0)
             {
                 var pole = Complex.Exp(new Complex(stage.Pole1, stage.Imaginary) * dt);
-                sections[i] = new(1, 0, 0, -2 * pole.Real, Power(pole));
-                continue;
+                a1 = -2 * pole.Real;
+                a2 = Power(pole);
             }
-            // 实极点逐个映射，第二极点用 0 标记缺省。分子在 z=1 的零点个数决定抑制直流的阶数。
-            double pole1 = Math.Exp(stage.Pole1 * dt);
-            double pole2 = stage.Pole2 == 0 ? 0 : Math.Exp(stage.Pole2 * dt);
-            sections[i] = new(1, -stage.ZerosAtOrigin, stage.ZerosAtOrigin == 2 ? 1 : 0, -(pole1 + pole2), pole1 * pole2);
+            else
+            {
+                double pole1 = Math.Exp(stage.Pole1 * dt);
+                double pole2 = stage.Pole2 == 0 ? 0 : Math.Exp(stage.Pole2 * dt);
+                a1 = -(pole1 + pole2);
+                a2 = pole1 * pole2;
+            }
+            if (i < fixedCount)
+            {
+                sections[i] = new(1, -stage.ZerosAtOrigin, stage.ZerosAtOrigin == 2 ? 1 : 0, a1, a2);
+            }
+            else
+            {
+                sections[i] = new(1, 0, 0, a1, a2);
+            }
         }
 
-        // 1000ad90 compares 101 logarithmic frequencies from 20 Hz through Nyquist.
-        // The fixed sections supply the poles and DC zeros. The last numerator
-        // is fitted after normalizing both responses at the curve's reference frequency.
+        // APxRT 1000ad90 compares 101 logarithmic frequencies from 20 Hz through Nyquist.
         const int lastPoint = 100;
         const double anchor = 20 * Math.Tau;
         double ratio = Math.PI * rate / anchor;
         var target = new (Complex Z, Complex Z2, double AnalogPower, double DigitalPower)[lastPoint + 1];
-        // 先让两条目标曲线各自在参考频率为 1，再比较从 20 Hz 到奈奎斯特的对数间隔频点。
-        double referenceHz = weighting == AnalyzerWeighting.Ccir2k ? 2000 : 1000;
-        var reference = Response(referenceHz * Math.Tau);
+        var reference = Response(spec.ReferenceHz * Math.Tau);
         for (int i = 0; i <= lastPoint; i++)
         {
             var point = Response(anchor * Math.Pow(ratio, i / (double)lastPoint));
             target[i] = (point.Z, point.Z2, point.AnalogPower / reference.AnalogPower, point.DigitalPower / reference.DigitalPower);
         }
 
-        // 以频带上缘的偏差启动拟合，仅调末节分子的两项，保留已映射的各级极点。
+        // 1000ad90 L7205-7217: 用 Nyquist 频点的幅值比初始化所有待拟合节的 (b1, b2) = (seed, -seed)
         double edgeGain = Math.Sqrt(target[^1].AnalogPower / target[^1].DigitalPower);
         double seed = (1 - edgeGain) / 2;
-        var fitted = Fit(seed, Score);
-        sections[^1] = sections[^1] with { B1 = fitted.B1, B2 = fitted.B2 };
+        int dim = fittedCount * 2;
+        var start = new double[dim];
+        for (int s = 0; s < fittedCount; s++)
+        {
+            start[2 * s] = seed;
+            start[2 * s + 1] = -seed;
+        }
+
+        var fitted = FitNelderMead(start, Score);
+        for (int s = 0; s < fittedCount; s++)
+        {
+            sections[fixedCount + s] = sections[fixedCount + s] with
+            {
+                B1 = fitted[2 * s],
+                B2 = fitted[2 * s + 1]
+            };
+        }
+
         double gain = 1;
-        // 串联各节在参考频率的幅度相乘，其倒数作为总增益，使参考音通过后幅度不变。
         for (int i = 0; i < sections.Length; i++)
         {
             var c = sections[i];
@@ -89,23 +186,26 @@ internal static class ApxAnsiWeighting
             var denominator = c.A1 * reference.Z + Complex.One + c.A2 * reference.Z2;
             gain *= Math.Sqrt(Power(numerator) / Power(denominator));
         }
-        return new(sections, 1 / gain);
+        return new(sections, spec.OverallGain / gain);
 
-        // 对一个候选分子，在所有目标频点计算相对误差的 dB 值，以最差频点的绝对偏差给它评分。
-        double Score(double first, double second)
+        double Score(double[] x)
         {
-            double inverseReference = 1 / Power(Complex.One + first * reference.Z + second * reference.Z2);
+            double refNumPow = 1.0;
+            for (int s = 0; s < fittedCount; s++)
+                refNumPow *= Power(Complex.One + x[2 * s] * reference.Z + x[2 * s + 1] * reference.Z2);
+            double inverseReference = 1.0 / refNumPow;
             double worst = 0;
             foreach (var point in target)
             {
-                double numerator = Power(Complex.One + first * point.Z + second * point.Z2);
-                double error = Math.Abs(10 * Math.Log10(point.DigitalPower * numerator * inverseReference / point.AnalogPower));
-                worst = Math.Max(worst, error);
+                double numPow = 1.0;
+                for (int s = 0; s < fittedCount; s++)
+                    numPow *= Power(Complex.One + x[2 * s] * point.Z + x[2 * s + 1] * point.Z2);
+                double error = Math.Abs(10 * Math.Log10(point.DigitalPower * numPow * inverseReference / point.AnalogPower));
+                if (error > worst) worst = error;
             }
             return worst;
         }
 
-        // 给定角频率 rad/s，同时求模拟 H(jω) 和数字 H(exp(jωdt))。每一节的乘积给出整条链的响应。
         (Complex Z, Complex Z2, double AnalogPower, double DigitalPower) Response(double omega)
         {
             var s = new Complex(0, omega);
@@ -126,59 +226,259 @@ internal static class ApxAnsiWeighting
         }
     }
 
-    // 复响应的模平方是功率增益，实部与虚部的正负都不会造成负功率。
     private static double Power(Complex value) => value.Real * value.Real + value.Imaginary * value.Imaginary;
 
-    // 在两个待定分子系数构成的平面上，用三个候选点寻找最小的最坏偏差。
-    private static Candidate Fit(double seed, Func<double, double, double> score)
+    // 通用 N 维 Nelder-Mead 单形优化器（严格对齐 APxRT 10011710 / 100115b0：索引跟踪 best/secondWorst/worst、无排序、shrink 不更新 best）
+    private static double[] FitNelderMead(double[] start, Func<double[], double> score)
     {
-        // APxRT 10011710 seeds a two-dimensional simplex with 5% steps.
-        // 100115b0 stops it when the sample variance is below (1e-9 dB)^2.
-        double step = seed == 0 ? .00025 : seed * 1.05;
-        Candidate[] simplex = [At(seed, -seed), At(step, -seed), At(seed, seed == 0 ? .00025 : -step)];
-        for (int i = 0; i < 5000; i++)
+        int n = start.Length;
+        int m = n + 1;
+        var vertices = new double[m][];
+        var values = new double[m];
+
+        vertices[0] = (double[])start.Clone();
+        values[0] = score(vertices[0]);
+        int bestIdx = 0, worstIdx = 0, secondWorstIdx = 0;
+        double bestVal = values[0], worstVal = values[0], secondWorstVal = values[0];
+
+        for (int i = 1; i < m; i++)
         {
-            Array.Sort(simplex, static (left, right) => left.Error.CompareTo(right.Error));
-            var best = simplex[0];
-            var middle = simplex[1];
-            var worst = simplex[2];
-            // 比较三个误差的离散程度。达到停止阈值表示三个评分已很接近，无法据此证明全局最优。
-            double d1 = middle.Error - best.Error, d2 = worst.Error - best.Error;
-            double sum = d1 + d2;
-            double variance = (d1 * d1 + d2 * d2 - sum * sum / 3) / 2;
-            if (Math.Abs(variance) < 1e-9 * 1e-9) return best;
-
-            // 用另外两点的中点作镜面，将最差点反射到另一侧，探测误差是否沿该方向减小。
-            double mid1 = (best.B1 + middle.B1) / 2, mid2 = (best.B2 + middle.B2) / 2;
-            Candidate reflected = At(2 * mid1 - worst.B1, 2 * mid2 - worst.B2);
-            if (reflected.Error < best.Error)
+            var pt = (double[])start.Clone();
+            pt[i - 1] = pt[i - 1] == 0.0 ? 0.00025 : pt[i - 1] * 1.05;
+            vertices[i] = pt;
+            double f = score(pt);
+            values[i] = f;
+            if (bestVal <= f)
             {
-                // 反射已刷新最好成绩时再向外试一步，保留两次试探中误差较小的一点。
-                Candidate expanded = At(mid1 + 2 * (mid1 - worst.B1), mid2 + 2 * (mid2 - worst.B2));
-                simplex[2] = expanded.Error < reflected.Error ? expanded : reflected;
-                continue;
+                if (f <= worstVal)
+                {
+                    if (secondWorstVal < f && f < worstVal)
+                    {
+                        secondWorstVal = f;
+                        secondWorstIdx = i;
+                    }
+                }
+                else
+                {
+                    secondWorstVal = worstVal;
+                    secondWorstIdx = worstIdx;
+                    worstVal = f;
+                    worstIdx = i;
+                }
             }
-            // 反射只优于中间点时，直接替换最差点，再对新的三个点排序。
-            if (reflected.Error < middle.Error)
+            else
             {
-                simplex[2] = reflected;
-                continue;
+                bestVal = f;
+                bestIdx = i;
             }
-
-            // 未找到足够好的反射点时向中点收缩。若仍无改进，让另两点都向最好点靠近。
-            var edge = reflected.Error < worst.Error ? reflected : worst;
-            Candidate contracted = At((edge.B1 + mid1) / 2, (edge.B2 + mid2) / 2);
-            if (contracted.Error < edge.Error)
-            {
-                simplex[2] = contracted;
-                continue;
-            }
-            simplex[1] = At((best.B1 + middle.B1) / 2, (best.B2 + middle.B2) / 2);
-            simplex[2] = At((best.B1 + worst.B1) / 2, (best.B2 + worst.B2) / 2);
         }
-        throw new InvalidOperationException("The realtime weighting design did not converge.");
 
-        // 把系数与同一次计算得到的评分装在一起，保证排序与下次搜索针对相同候选。
-        Candidate At(double b1, double b2) => new(b1, b2, score(b1, b2));
+        static double SampleVariance(double[] f)
+        {
+            double f0 = f[0];
+            double sum = 0.0, sumSq = 0.0;
+            for (int i = 1; i < f.Length; i++)
+            {
+                double d = f[i] - f0;
+                sum += d;
+                sumSq += d * d;
+            }
+            return Math.Abs((sumSq - sum * sum / f.Length) / (f.Length - 1));
+        }
+
+        double variance = SampleVariance(values);
+        int iter = 1;
+        var centroid = new double[n];
+        var reflected = new double[n];
+        var expanded = new double[n];
+        var contracted = new double[n];
+
+        while (variance >= 1e-18 && iter <= 5000)
+        {
+            Array.Clear(centroid);
+            for (int i = 0; i < m; i++)
+            {
+                if (i == worstIdx) continue;
+                var vi = vertices[i];
+                for (int j = 0; j < n; j++) centroid[j] += vi[j];
+            }
+            for (int j = 0; j < n; j++)
+            {
+                centroid[j] /= n;
+                reflected[j] = 2.0 * centroid[j] - vertices[worstIdx][j];
+            }
+
+            double fRefl = score(reflected);
+            if (bestVal <= fRefl && fRefl < secondWorstVal)
+            {
+                Array.Copy(reflected, vertices[worstIdx], n);
+                values[worstIdx] = fRefl;
+                int prevSec = secondWorstIdx;
+                worstVal = secondWorstVal;
+                worstIdx = secondWorstIdx;
+                secondWorstVal = bestVal;
+                secondWorstIdx = bestIdx;
+                for (int i = 0; i < m; i++)
+                {
+                    if (i != bestIdx && i != prevSec && secondWorstVal < values[i])
+                    {
+                        secondWorstVal = values[i];
+                        secondWorstIdx = i;
+                    }
+                }
+            }
+            else if (fRefl < bestVal)
+            {
+                for (int j = 0; j < n; j++)
+                    expanded[j] = (centroid[j] - vertices[worstIdx][j]) * 2.0 + centroid[j];
+                double fExp = score(expanded);
+                bestIdx = worstIdx;
+                int prevSec = secondWorstIdx;
+                if (fRefl <= fExp)
+                {
+                    Array.Copy(reflected, vertices[worstIdx], n);
+                    values[worstIdx] = fRefl;
+                    bestVal = fRefl;
+                }
+                else
+                {
+                    Array.Copy(expanded, vertices[worstIdx], n);
+                    values[worstIdx] = fExp;
+                    bestVal = fExp;
+                }
+                worstIdx = secondWorstIdx;
+                worstVal = secondWorstVal;
+                secondWorstVal = bestVal;
+                secondWorstIdx = bestIdx;
+                for (int i = 0; i < m; i++)
+                {
+                    if (i != bestIdx && i != prevSec && secondWorstVal < values[i])
+                    {
+                        secondWorstVal = values[i];
+                        secondWorstIdx = i;
+                    }
+                }
+            }
+            else
+            {
+                bool doShrink = false;
+                if (fRefl >= secondWorstVal)
+                {
+                    if (worstVal <= fRefl)
+                    {
+                        for (int j = 0; j < n; j++)
+                            contracted[j] = (vertices[worstIdx][j] + centroid[j]) / 2.0;
+                        double fIc = score(contracted);
+                        if (worstVal <= fIc)
+                        {
+                            doShrink = true;
+                        }
+                        else
+                        {
+                            Array.Copy(contracted, vertices[worstIdx], n);
+                            values[worstIdx] = fIc;
+                            worstVal = fIc;
+                            if (fIc <= secondWorstVal)
+                            {
+                                if (fIc < bestVal)
+                                {
+                                    bestIdx = worstIdx;
+                                    bestVal = fIc;
+                                }
+                                int prevSec = secondWorstIdx;
+                                worstVal = secondWorstVal;
+                                worstIdx = secondWorstIdx;
+                                secondWorstVal = bestVal;
+                                secondWorstIdx = bestIdx;
+                                for (int i = 0; i < m; i++)
+                                {
+                                    if (i != bestIdx && i != prevSec && secondWorstVal < values[i])
+                                    {
+                                        secondWorstVal = values[i];
+                                        secondWorstIdx = i;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int j = 0; j < n; j++)
+                            contracted[j] = (reflected[j] + centroid[j]) / 2.0;
+                        double fOc = score(contracted);
+                        if (fRefl <= fOc)
+                        {
+                            doShrink = true;
+                        }
+                        else
+                        {
+                            Array.Copy(contracted, vertices[worstIdx], n);
+                            values[worstIdx] = fOc;
+                            worstVal = fOc;
+                            if (fOc <= secondWorstVal)
+                            {
+                                if (fOc < bestVal)
+                                {
+                                    bestIdx = worstIdx;
+                                    bestVal = fOc;
+                                }
+                                int prevSec = secondWorstIdx;
+                                worstVal = secondWorstVal;
+                                worstIdx = secondWorstIdx;
+                                secondWorstVal = bestVal;
+                                secondWorstIdx = bestIdx;
+                                for (int i = 0; i < m; i++)
+                                {
+                                    if (i != bestIdx && i != prevSec && secondWorstVal < values[i])
+                                    {
+                                        secondWorstVal = values[i];
+                                        secondWorstIdx = i;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    doShrink = true;
+                }
+
+                if (doShrink)
+                {
+                    secondWorstVal = bestVal;
+                    worstVal = bestVal;
+                    secondWorstIdx = bestIdx;
+                    worstIdx = bestIdx;
+                    for (int i = 0; i < m; i++)
+                    {
+                        if (i == bestIdx) continue;
+                        var vi = vertices[i];
+                        var vb = vertices[bestIdx];
+                        for (int j = 0; j < n; j++)
+                            vi[j] = (vb[j] + vi[j]) / 2.0;
+                        double f = score(vi);
+                        values[i] = f;
+                        if (worstVal < f)
+                        {
+                            secondWorstVal = worstVal;
+                            secondWorstIdx = worstIdx;
+                            worstVal = f;
+                            worstIdx = i;
+                        }
+                        if (secondWorstVal < f && f < worstVal)
+                        {
+                            secondWorstVal = f;
+                            secondWorstIdx = i;
+                        }
+                    }
+                }
+            }
+
+            variance = SampleVariance(values);
+            iter++;
+        }
+
+        return vertices[bestIdx];
     }
 }

@@ -26,6 +26,8 @@ internal sealed class DigitalResidualMeter
         _residualAc = new(sampleRate);
     }
 
+    internal void SetReadingRate(double readingsPerSecond) => _rms.SetReadingRate(readingsPerSecond);
+
     // 输入是上游已处理的工作区，按顺序就地陷波、计权、条件交流耦合，最后送入持续运行的 RMS 检波器。
     public void Process(Span<double> workspace, double centerHz, AnalyzerWeighting weighting, bool dcCoupled)
     {

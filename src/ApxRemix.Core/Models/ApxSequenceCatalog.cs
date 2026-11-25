@@ -101,3 +101,4 @@ public static class ApxSequenceCatalog
         new("VddRamp", "Vdd Ramp", Group.All)
     ]);
 }
+

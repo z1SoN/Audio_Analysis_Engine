@@ -151,7 +151,11 @@ internal static partial class SequenceBinEstimator
     // 仅请求未经归一化的时域窗，长度与最终要相乘的采样块一致。
     internal static double[]? RawWindow(int length, FftWindowType type)
     {
-        if (ActiveLibraryDirectory == null) return null;
+        // The desktop Framework worker can evaluate these cosine windows without MKL.
+        if (ActiveLibraryDirectory == null &&
+            !(DesktopWorksheet && OperatingSystem.IsWindows() && Environment.Is64BitOperatingSystem && File.Exists(DesktopWorker)
+                && type is FftWindowType.Hann or FftWindowType.BlackmanHarris or FftWindowType.BlackmanHarris4))
+            return null;
         using var message = new MemoryStream();
         using var writer = new BinaryWriter(message);
         writer.Write(-5);

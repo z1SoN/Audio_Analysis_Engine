@@ -80,7 +80,7 @@ public static class FftEngine
             double x = n * twoPiOverN - Math.PI;
             double w = windowType switch
             {
-                FftWindowType.Rectangular => 1.0,
+                FftWindowType.Rectangular or FftWindowType.NoneMoveToBinCenter => 1.0,
 
                 FftWindowType.Hann => 0.5 + Math.Cos(x) * 0.5,
 

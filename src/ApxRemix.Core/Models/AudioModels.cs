@@ -208,6 +208,16 @@ public sealed class AnalyzerFilterConfig
     public AnalyzerFilterConfig Clone() => (AnalyzerFilterConfig)MemberwiseClone();
     // 高低通以 Hz 保存截止频率，低通类型决定滤波器。主路径计权和残余计权分别配置，改变一条路径会直接改变该路径的 RMS。
     public double HighPassHz { get; set; } = 20.0;
+    public HighPassFilterType HighPassType { get; set; } = HighPassFilterType.Butterworth4;
+    public bool Ch1HighPassEnabled { get; set; } = true;
+    public bool Ch2HighPassEnabled { get; set; } = true;
+    public bool Ch1LowPassEnabled { get; set; } = true;
+    public bool Ch2LowPassEnabled { get; set; } = true;
+    public bool Ch1WeightingEnabled { get; set; } = true;
+    public bool Ch2WeightingEnabled { get; set; } = true;
+    public double DfdMeterLowPassHz { get; set; } = 2000.0;
+    public bool EnableRealtimeImd { get; set; } = true;
+    public SweepSettlingConfig? DetailedSettling { get; set; }
     public double LowPassHz { get; set; } = 20000.0;
     public LowPassFilterType LowPassType { get; set; } = LowPassFilterType.Butterworth8;
     public AnalyzerWeighting Weighting { get; set; } = AnalyzerWeighting.Flat;
@@ -540,6 +550,8 @@ public sealed class FrequencySweepConfig
     // 闭环目标用输入 dBFS 表示，输出只能在允许的发生器电平范围变化。容差和失败策略共同决定该点如何收尾。
     public bool EnableTargetRegulation { get; set; }
     public double TargetRegulatedLevelDbfs { get; set; } = -10.0;
+    public double? TargetRegulatedThdnPercent { get; set; }
+    public int? RegulationSearchSteps { get; set; }
     public double RegulationToleranceDb { get; set; } = 0.15;
     public double RegulationMaxGeneratorDbfs { get; set; } = -0.5;
     public double RegulationMinGeneratorDbfs { get; set; } = -90.0;
@@ -626,8 +638,8 @@ public sealed class ContinuousSweepConfig
     public int ResponseTailMs { get; set; } = 350;
     public int OutputPoints { get; set; } = 200;
     public ContinuousPhaseMode PhaseMode { get; set; } = ContinuousPhaseMode.RelativeToCh1;
-    public decimal? ExcessMinHz { get; set; }
-    public decimal? ExcessMaxHz { get; set; }
+    public decimal? ExcessMinHz { get; set; } = 100m;
+    public decimal? ExcessMaxHz { get; set; } = 10000m;
     public double InputFullScaleVoltageVrms { get; set; } = 2.0;
     public double OutputFullScaleVoltageVrms { get; set; } = 2.0;
 }
@@ -741,6 +753,8 @@ public sealed record TransferFileSettings
 }
 
 // 传递函数要明确参考和响应的路由，FFT、重叠与平均决定每次估计用了多少共同时间段。
+public enum TransferFunctionAlignMode { None, RelativeToRef, RelativeToInputChannel }
+
 public sealed class TransferFunctionConfig
 {
     public TransferFunctionCalculationMode CalculationMode { get; set; } = TransferFunctionCalculationMode.H1;
@@ -752,6 +766,8 @@ public sealed class TransferFunctionConfig
     public double OverlapRatio { get; set; } = 0.5;
     public FftWindowType WindowType { get; set; } = FftWindowType.Hann;
     public int Averages { get; set; }
+    public TransferFunctionAlignMode AlignMode { get; set; } = TransferFunctionAlignMode.None;
+    public int? ManualDelaySamples { get; set; }
     // 先用绝对门限检查通道是否有信号，再结合相对谱峰范围和绝对功率下限剔除参考不足的频点，防止除以过小参考谱。
     public double MinReferencePowerDbfs { get; set; } = -90.0;
     public double DynamicRangeBelowPeakDb { get; set; } = 45.0;
@@ -815,11 +831,15 @@ public sealed record SequenceResultDetail(string Name, string Reading, string Un
 }
 
 public sealed record SequenceResultSettings(string Name, bool Included, BenchGraphLimitSettings? Limits);
+public sealed record SequenceMultitoneSettings(int Tones, int FftLength, string PhaseScheme);
+public sealed record SequenceSweepRegulationSettings(bool Thdn, double ThdnPercent, InputChannelSelection? Channel,
+    int Steps, double MinimumDbfs, double MaximumDbfs);
 public sealed record SequenceStepSettings(NavigationViewKind Measurement, bool Included, List<SequenceResultSettings>? Results = null,
     bool Present = true, string? CustomName = null);
 public sealed record SequenceDisplaySettings(string LevelResult, string ThdResult, string SignalResult,
     string FrequencyResult, decimal DeviationFromHz, decimal DeviationToHz, bool ShowSecondChannel,
-    InputChannelSelection ProductChannel);
+    InputChannelSelection ProductChannel, bool DefaultSelectorVisible = true,
+    Dictionary<NavigationViewKind, bool>? SelectorVisibility = null);
 
 public sealed record BenchMeterSettings(BenchMeterKind Kind, LevelDisplayUnit Level, DistortionDisplayUnit Ratio, string FrequencyUnit,
     bool ShowBars = true, bool AutoScale = true, bool LogScale = false, double RangeMin = -80, double RangeMax = 5,
@@ -843,6 +863,8 @@ public sealed class ProjectStateFile
     public bool CatalogNoiseUsePathLowpass { get; set; }
     // 保存 Sequence 选中步骤及每项限值；上次报告也可随工程保存，重新打开时仍只是历史读数。
     public List<SequenceStepSettings>? SequenceSteps { get; set; }
+    public SequenceMultitoneSettings? SequenceMultitone { get; set; }
+    public SequenceSweepRegulationSettings? SequenceSweepRegulation { get; set; }
     public bool SequencePathIncluded { get; set; } = true;
     public List<SequenceStepResult>? SequenceReport { get; set; }
     public NavigationViewKind SequenceView { get; set; } = NavigationViewKind.LevelAndGain;

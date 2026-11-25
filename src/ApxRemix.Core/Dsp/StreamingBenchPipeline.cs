@@ -20,7 +20,10 @@ public sealed class StreamingBenchPipeline
     public const int PanelReadingsPerSecond = 4;
 
     private readonly int _basePacketSize;
-    private readonly int _packetsPerReading;
+    private int _packetsPerReading;
+    private readonly bool _transportClock;
+    private double _readingRateHz;
+    private double? _pendingReadingRateHz;
     private readonly double _fractionalPacketSize;
     private double _packetRemainder;
     private int _packetSize;
@@ -34,22 +37,32 @@ public sealed class StreamingBenchPipeline
     private PanelReportParameters? _panelReportParameters;
     private (AnalyzerFilterConfig Filter, double Gain1Db, double Gain2Db, double GeneratorHz)? _pendingPanelConfiguration;
 
-    // 记录会影响面板报告的设置。与上一组比较时才能决定是否重新计数本轮已经送入的毫秒包。
+    // 记录会影响面板报告的设置。与上一组比较时才能决定是否重新计数本轮已经送入的毫秒包（对齐 APxRT AU1wHikrya）。
     private readonly record struct PanelReportParameters(
-        double GeneratorHz, double HighPassHz, double LowPassHz, LowPassFilterType LowPassType,
-        AnalyzerWeighting MainWeighting, AnalyzerWeighting ResidualWeighting,
+        double GeneratorHz, double HighPassHz, HighPassFilterType HighPassType,
+        bool Ch1HighPassEnabled, bool Ch2HighPassEnabled,
+        double LowPassHz, LowPassFilterType LowPassType,
+        bool Ch1LowPassEnabled, bool Ch2LowPassEnabled,
+        AnalyzerWeighting MainWeighting, bool Ch1WeightingEnabled, bool Ch2WeightingEnabled,
+        AnalyzerWeighting ResidualWeighting,
         NotchTuningMode NotchMode, double FixedNotchHz, NotchTuningMode BandpassMode,
         double FixedBandpassHz, BandpassSelectivity Selectivity, bool PhaseReferenceIsCh2,
-        ImdMeasurementStandard ImdStandard);
+        bool EnableRealtimeImd, ImdMeasurementStandard ImdStandard);
 
     // 配置快照（仅在参数真正变化时重建对应 IIR，避免无故清空滤波器状态）
     private double _ch1GainDb;
     private double _ch2GainDb;
     private double _highPassHz = -1;
+    private HighPassFilterType _highPassType = HighPassFilterType.Butterworth4;
+    private double _hpRelativeCutoff;
     private double _lowPassHz = -1;
     private LowPassFilterType _lowPassType = LowPassFilterType.Butterworth8;
     private double _ellipticRelativeCutoff;
     private AnalyzerWeighting _weighting = AnalyzerWeighting.Flat;
+    private bool _hpOn1 = true, _hpOn2 = true;
+    private bool _lpOn1 = true, _lpOn2 = true;
+    private bool _wtOn1 = true, _wtOn2 = true;
+    private bool _enableRealtimeImd = true;
     private BandpassSelectivity _bpSelectivity = BandpassSelectivity.ThirdOctave;
     private NotchTuningMode _bpTuneMode = NotchTuningMode.Generator;
     private double _bpFixedCenterHz = 1000.0;
@@ -57,6 +70,7 @@ public sealed class StreamingBenchPipeline
     private double _activeBpCenter1, _activeBpCenter2;
 
     // 连续状态滤波器（Ch1 / Ch2 各自独立状态）
+    private readonly ApxInputEqFilter _inputEq = new();
     private ApxAcCouplingFilter _acOnly1, _acOnly2;
     private StreamingIirCascade _hp1, _hp2;
     private StreamingIirCascade _lp1, _lp2;
@@ -71,6 +85,7 @@ public sealed class StreamingBenchPipeline
     private double _prevPeak1, _prevPeak2;
     private readonly DigitalDcMeter _dc1, _dc2;
     private readonly DigitalResidualMeter _residual1, _residual2;
+    private readonly ApxRealtimeImdMeter _imd;
     private AnalyzerWeighting _residualWeighting;
     private NotchTuningMode _notchMode;
     private double _fixedNotchHz;
@@ -80,6 +95,7 @@ public sealed class StreamingBenchPipeline
     private readonly double[] _acL, _acR;
     private readonly double[] _bpL, _bpR;
     private readonly FftEngine.WindowData? _bandpassRecordWindow;
+    private readonly FftEngine.WindowData? _bandpassRecordWindowPlusOne;
 
     public int SampleRate { get; }
     public int ReadingsPerSecond { get; }
@@ -92,31 +108,50 @@ public sealed class StreamingBenchPipeline
 
     // 采样率决定一秒有多少音频点，读数率决定多久报告一次。这两种时间尺度在面板路径中由毫秒包连接。
     public StreamingBenchPipeline(int sampleRate, AnalyzerFilterConfig? initialFilter, int readingsPerSecond)
+        : this(sampleRate, initialFilter, readingsPerSecond, readingsPerSecond == PanelReadingsPerSecond) { }
+
+    internal static StreamingBenchPipeline ForRecorder(int sampleRate, AnalyzerFilterConfig filter, double readingRateHz) =>
+        new(sampleRate, filter, readingRateHz, transportClock: true);
+
+    private StreamingBenchPipeline(int sampleRate, AnalyzerFilterConfig? initialFilter, double readingsPerSecond, bool transportClock)
     {
-        if (readingsPerSecond != PanelReadingsPerSecond && readingsPerSecond != DefaultReadingsPerSecond)
-            throw new ArgumentOutOfRangeException(nameof(readingsPerSecond));
+        if (!double.IsFinite(readingsPerSecond) || readingsPerSecond <= 0 || readingsPerSecond > 1000)
+            throw new ArgumentOutOfRangeException(nameof(readingsPerSecond), "ReadingsPerSecond must be in (0, 1000].");
         SampleRate = Math.Max(8000, sampleRate);
-        ReadingsPerSecond = readingsPerSecond;
-        bool panel = ReadingsPerSecond == PanelReadingsPerSecond;
-        // 每毫秒先取基准点数，余下的小数累积到下一包。250 包形成一次 4 Hz 报告。
-        if (panel)
+        ReadingsPerSecond = (int)Math.Round(readingsPerSecond);
+        _readingRateHz = readingsPerSecond;
+        _transportClock = transportClock;
+        if (_transportClock)
         {
             // APx500 file input emits one transport report per millisecond. The
             // fractional samples carry into later reports (44/45 at 44.1 kHz).
             double samplesPerMillisecond = SampleRate * .001;
             _basePacketSize = (int)Math.Floor(samplesPerMillisecond);
             _fractionalPacketSize = samplesPerMillisecond - _basePacketSize;
-            _packetsPerReading = 1000 / PanelReadingsPerSecond;
+            _packetsPerReading = (int)Math.Ceiling(1000 / _readingRateHz);
         }
         else
         {
-            // 常规读数每包即一窗，用近似 Fs/20 点。此模式还另算同一带通记录的加窗 RMS。
-            _basePacketSize = Math.Max(64, (int)Math.Round(SampleRate / DefaultReadingsPerSecond));
+            // 支持任意读速（如 16/20/50/64 Hz）；小数样本跨读数结转以保持精确平均读速（如 44.1 kHz / 64 Hz = 689.0625）。
+            double exactSamples = SampleRate / _readingRateHz;
+            if (exactSamples >= 64.0)
+            {
+                _basePacketSize = (int)Math.Floor(exactSamples);
+                _fractionalPacketSize = exactSamples - _basePacketSize;
+                if (_fractionalPacketSize < 1e-12) _fractionalPacketSize = 0.0;
+            }
+            else
+            {
+                _basePacketSize = 64;
+                _fractionalPacketSize = 0.0;
+            }
             _packetsPerReading = 1;
             // The original WAV RealtimeProcessor begins at zero. Keep the
-            // standalone 20 Hz aperture's established sub-PCM initial envelope.
+            // standalone non-panel aperture's established sub-PCM initial envelope.
             _prevPeak1 = _prevPeak2 = double.Epsilon;
             _bandpassRecordWindow = FftEngine.CreateWindow(_basePacketSize, FftWindowType.BlackmanHarris);
+            if (_fractionalPacketSize > 0.0)
+                _bandpassRecordWindowPlusOne = FftEngine.CreateWindow(_basePacketSize + 1, FftWindowType.BlackmanHarris);
         }
         // 预留可能多出一个点的最大包长。主路、交流路和带通路有各自缓冲，避免就地处理提前改写其他分支的输入。
         _packetSize = NextPacketSize();
@@ -133,16 +168,17 @@ public sealed class StreamingBenchPipeline
         // 两个声道及各仪表的检波器都需独立记忆。即使带宽相同，同一时刻听到的波形也可能不同。
         _dc1 = new(SampleRate);
         _dc2 = new(SampleRate);
-        _residual1 = new(SampleRate, ReadingsPerSecond);
-        _residual2 = new(SampleRate, ReadingsPerSecond);
+        _residual1 = new(SampleRate, _readingRateHz);
+        _residual2 = new(SampleRate, _readingRateHz);
+        _imd = new(SampleRate, _readingRateHz);
         _acOnly1 = new ApxAcCouplingFilter(SampleRate);
         _acOnly2 = new ApxAcCouplingFilter(SampleRate);
-        _weightedRms1 = new ApxRmsDetector(SampleRate, ReadingsPerSecond);
-        _weightedRms2 = new ApxRmsDetector(SampleRate, ReadingsPerSecond);
-        _acRms1 = new ApxRmsDetector(SampleRate, ReadingsPerSecond);
-        _acRms2 = new ApxRmsDetector(SampleRate, ReadingsPerSecond);
-        _bpRms1 = new ApxRmsDetector(SampleRate, ReadingsPerSecond);
-        _bpRms2 = new ApxRmsDetector(SampleRate, ReadingsPerSecond);
+        _weightedRms1 = new ApxRmsDetector(SampleRate, _readingRateHz);
+        _weightedRms2 = new ApxRmsDetector(SampleRate, _readingRateHz);
+        _acRms1 = new ApxRmsDetector(SampleRate, _readingRateHz);
+        _acRms2 = new ApxRmsDetector(SampleRate, _readingRateHz);
+        _bpRms1 = new ApxRmsDetector(SampleRate, _readingRateHz);
+        _bpRms2 = new ApxRmsDetector(SampleRate, _readingRateHz);
 
         // 从直通开始，再用实际设置装入滤波器。这样未开启的一段也能与其余级采用同一调用顺序。
         _hp1 = StreamingIirCascade.Bypass();
@@ -158,11 +194,16 @@ public sealed class StreamingBenchPipeline
         Configure(cfg, 0.0, 0.0, 1000.0);
     }
 
+    /// <summary>配置 APxRT 原生兼容的双槽位 IIR Biquad 输入 EQ（对齐 TwoChannelMeasurer.SetEqFilter）。</summary>
+    public void SetEqFilter(int order, double[] b1, double[] b2, double[] a1, double[] a2,
+        double overallGain, int index, bool on1, bool on2) =>
+        _inputEq.SetEqFilter(order, b1, b2, a1, a2, overallGain, index, on1, on2);
+
     // 面板设置先做快照，下一包到来才应用，从而避免在一包中间混用两套状态。常规路径立即生效。
     /// <summary>热更新信号路径滤波与带通配置（仅在参数实际改变时重建受影响的滤波器段）。</summary>
     public void Configure(AnalyzerFilterConfig filter, double ch1GainDb, double ch2GainDb, double generatorFreqHz)
     {
-        if (ReadingsPerSecond == PanelReadingsPerSecond)
+        if (_transportClock)
         {
             _pendingPanelConfiguration = (filter.Clone(), ch1GainDb, ch2GainDb, generatorFreqHz);
             return;
@@ -170,25 +211,32 @@ public sealed class StreamingBenchPipeline
         ApplyConfiguration(filter, ch1GainDb, ch2GainDb, generatorFreqHz);
     }
 
+    internal void SetRecorderReadingRate(double readingRateHz) => _pendingReadingRateHz = readingRateHz;
+
     // 按设置变化分别更新需要重设计的级。中心频率用 Hz，通道增益用 dB，延迟状态是否保留取决于对应分支。
     private void ApplyConfiguration(AnalyzerFilterConfig filter, double ch1GainDb, double ch2GainDb, double generatorFreqHz)
     {
         double generator = Math.Clamp(generatorFreqHz, 5.0, SampleRate * 0.48);
         bool bpModeChanged = _bpSelectivity != filter.BandpassSelectivity
             || _bpTuneMode != filter.BandpassTuneMode
-            || ((ReadingsPerSecond != PanelReadingsPerSecond || filter.BandpassTuneMode == NotchTuningMode.Fixed)
+            || ((!_transportClock || filter.BandpassTuneMode == NotchTuningMode.Fixed)
                 && Math.Abs(_bpFixedCenterHz - filter.BandpassCenterHz) > 1e-3);
         // 面板报告参数改变时重新计算本轮包数。这里的计数复位与后面各检波器的状态更新是不同操作。
-        if (_packetsPerReading > 1)
+        if (_transportClock)
         {
             // RealtimeProcessor compares ProcessingParameters before consuming the
             // next packet, including stored frequencies for inactive filter modes.
             // A report restart retains detector accumulations and filter delays.
-            var parameters = new PanelReportParameters(generatorFreqHz, filter.HighPassHz, filter.LowPassHz,
-                filter.LowPassType, filter.Weighting, filter.ResidualWeighting, filter.NotchTuningMode,
+            var parameters = new PanelReportParameters(
+                generatorFreqHz, filter.HighPassHz, filter.HighPassType,
+                filter.Ch1HighPassEnabled, filter.Ch2HighPassEnabled,
+                filter.LowPassHz, filter.LowPassType,
+                filter.Ch1LowPassEnabled, filter.Ch2LowPassEnabled,
+                filter.Weighting, filter.Ch1WeightingEnabled, filter.Ch2WeightingEnabled,
+                filter.ResidualWeighting, filter.NotchTuningMode,
                 filter.FixedNotchFrequencyHz, filter.BandpassTuneMode, filter.BandpassCenterHz,
                 filter.BandpassSelectivity, filter.ReferenceChannel == AnalyzerReferenceChannel.Channel2,
-                filter.ImdStandard);
+                filter.EnableRealtimeImd, filter.ImdStandard);
             if (_panelReportParameters != parameters)
             {
                 _panelReportParameters = parameters;
@@ -202,41 +250,68 @@ public sealed class StreamingBenchPipeline
         _ch1GainDb = ch1GainDb;
         _ch2GainDb = ch2GainDb;
         _generatorFreqHz = generator;
+        _hpOn1 = filter.Ch1HighPassEnabled;
+        _hpOn2 = filter.Ch2HighPassEnabled;
+        _lpOn1 = filter.Ch1LowPassEnabled;
+        _lpOn2 = filter.Ch2LowPassEnabled;
+        _wtOn1 = filter.Ch1WeightingEnabled;
+        _wtOn2 = filter.Ch2WeightingEnabled;
+        _enableRealtimeImd = filter.EnableRealtimeImd;
+        _imd.Configure(filter.EnableRealtimeImd ? filter.ImdStandard : ImdMeasurementStandard.Auto, filter.DfdMeterLowPassHz);
 
-        // 10 Hz 附近的选择由专用交流耦合级实现，所以此时通用高通走直通，避免同一信号被高通两次。
-        if (Math.Abs(_highPassHz - filter.HighPassHz) > 1e-6)
+        // 10 Hz 附近的选择由专用交流耦合级实现，其他高通按 Butterworth4 或 Elliptic5 拓扑建立。
+        // 同拓扑下 HighPassHz 微调采用 APxRT FUN_10006120 的 1e-5 相对门限并保留滤波延迟历史；仅拓扑切换时重置。
+        if (_highPassHz != filter.HighPassHz || _highPassType != filter.HighPassType)
         {
+            bool wasActiveHp = _highPassHz > 0.0 && !(UseAcCoupling && _highPassType == HighPassFilterType.Butterworth4);
+            bool wantAcCoupling = Math.Abs(filter.HighPassHz - 10.0) < 0.05 && filter.HighPassType == HighPassFilterType.Butterworth4;
+            bool wantActiveHp = filter.HighPassHz > 0.0 && !wantAcCoupling;
+            bool sameTopology = wasActiveHp && wantActiveHp && _highPassType == filter.HighPassType;
+
             _highPassHz = filter.HighPassHz;
-            if (_highPassHz <= 0.0 || UseAcCoupling)
+            _highPassType = filter.HighPassType;
+
+            if (!wantActiveHp)
             {
                 _hp1 = StreamingIirCascade.Bypass();
                 _hp2 = StreamingIirCascade.Bypass();
+                _hpRelativeCutoff = 0.0;
             }
             else
             {
-                _hp1 = StreamingIirCascade.CreateButterworthHighPass(4, _highPassHz, SampleRate);
-                _hp2 = StreamingIirCascade.CreateButterworthHighPass(4, _highPassHz, SampleRate);
+                double cutoff = ApxEllipticLowPass.RelativeCutoff(_highPassHz, SampleRate);
+                if (!sameTopology || Math.Abs(cutoff - _hpRelativeCutoff) > _hpRelativeCutoff * ApxEllipticLowPass.RelativeRetuneTolerance)
+                {
+                    var (left, right) = _highPassType == HighPassFilterType.Elliptic5
+                        ? ApxEllipticLowPass.CreateEllipticHighPassStereo(_highPassHz, SampleRate)
+                        : (StreamingIirCascade.CreateButterworthHighPass(4, _highPassHz, SampleRate),
+                           StreamingIirCascade.CreateButterworthHighPass(4, _highPassHz, SampleRate));
+                    if (sameTopology)
+                    {
+                        left.CopyHistoryFrom(_hp1);
+                        right.CopyHistoryFrom(_hp2);
+                    }
+                    (_hp1, _hp2) = (left, right);
+                    _hpRelativeCutoff = cutoff;
+                }
             }
         }
 
-        bool panelAes17 = ReadingsPerSecond == PanelReadingsPerSecond && filter.LowPassType == LowPassFilterType.Aes17;
-        if ((panelAes17 ? _lowPassHz != filter.LowPassHz : Math.Abs(_lowPassHz - filter.LowPassHz) > 1e-6)
+        // 所有读速（4/16/20/50/64 Hz）统一支持 APxRT 8 阶椭圆低通（AES17 / Elliptic8），不再仅限 4 Hz 面板。
+        bool isEllipticLp = filter.LowPassType is LowPassFilterType.Aes17 or LowPassFilterType.Elliptic8;
+        if ((isEllipticLp ? _lowPassHz != filter.LowPassHz : Math.Abs(_lowPassHz - filter.LowPassHz) > 1e-6)
             || _lowPassType != filter.LowPassType)
         {
-            bool wasAes17 = _lowPassHz > 0 && _lowPassType == LowPassFilterType.Aes17;
+            bool wasEllipticLp = _lowPassHz > 0 && _lowPassType is LowPassFilterType.Aes17 or LowPassFilterType.Elliptic8;
             _lowPassHz = filter.LowPassHz;
             _lowPassType = filter.LowPassType;
-            // 面板的 AES17 低通由椭圆级承担。相对截止的微小变化先与阈值比较，超过才建立新系数。
-            if (_lowPassHz > 0 && panelAes17)
+            if (_lowPassHz > 0 && isEllipticLp)
             {
-                // The report resets on an exact settings change. The LP itself
-                // only retunes if normalized cutoff changes by more than 10 ppm.
                 double cutoff = ApxEllipticLowPass.RelativeCutoff(_lowPassHz, SampleRate);
-                if (!wasAes17 || Math.Abs(cutoff - _ellipticRelativeCutoff) > _ellipticRelativeCutoff * ApxEllipticLowPass.RelativeRetuneTolerance)
+                if (!wasEllipticLp || Math.Abs(cutoff - _ellipticRelativeCutoff) > _ellipticRelativeCutoff * ApxEllipticLowPass.RelativeRetuneTolerance)
                 {
                     var (left, right) = ApxEllipticLowPass.CreateStereo(cutoff, SampleRate);
-                    // 从同一种椭圆低通微调时继承各节历史。首次切入该类型时则保留新实例的零状态。
-                    if (wasAes17)
+                    if (wasEllipticLp)
                     {
                         left.CopyHistoryFrom(_lp1);
                         right.CopyHistoryFrom(_lp2);
@@ -247,7 +322,6 @@ public sealed class StreamingBenchPipeline
             }
             else
             {
-                // 其余情形只在选择八阶 Butterworth 且截止已启用时装入低通，否则此级直通。
                 bool useButterLp = _lowPassHz > 0.0 && _lowPassType == LowPassFilterType.Butterworth8;
                 _lp1 = useButterLp ? StreamingIirCascade.CreateButterworthLowPass(8, _lowPassHz, SampleRate) : StreamingIirCascade.Bypass();
                 _lp2 = useButterLp ? StreamingIirCascade.CreateButterworthLowPass(8, _lowPassHz, SampleRate) : StreamingIirCascade.Bypass();
@@ -288,7 +362,7 @@ public sealed class StreamingBenchPipeline
             NotchTuningMode.Fixed when _bpFixedCenterHz >= 10.0 => _bpFixedCenterHz,
             NotchTuningMode.Measured when measuredFreqHz <= 10 && activeCenter > 0 => activeCenter,
             NotchTuningMode.Measured => measuredFreqHz > 10.0 ? measuredFreqHz : _generatorFreqHz,
-            NotchTuningMode.Generator when ReadingsPerSecond == PanelReadingsPerSecond => _generatorFreqHz,
+            NotchTuningMode.Generator when _transportClock => _generatorFreqHz,
             _ when _bpFixedCenterHz > 10.0 => _bpFixedCenterHz,
             _ => _generatorFreqHz
         };
@@ -315,7 +389,9 @@ public sealed class StreamingBenchPipeline
 
     // 从音频回调的任意块长拼出仪表需要的内部包。尚未构成一包的部分留在缓冲中，绝对位置按实际到达样本累加。
     /// <summary>向连续状态机送入任意长度的音频回调采样块。</summary>
-    public void Process(ReadOnlySpan<double> left, ReadOnlySpan<double> right)
+    public void Process(ReadOnlySpan<double> left, ReadOnlySpan<double> right) => Process(left, right, null);
+
+    internal void Process(ReadOnlySpan<double> left, ReadOnlySpan<double> right, Action<StreamingBenchReading>? report)
     {
         int count = Math.Min(left.Length, right.Length);
         int offset = 0;
@@ -332,20 +408,22 @@ public sealed class StreamingBenchPipeline
 
             // 满包才进入滤波和报告流程，因此音频回调边界本身不会强制更新仪表。
             if (_pendingCount == _packetSize)
-                ProcessPendingPacket();
+                ProcessPendingPacket(report);
         }
     }
 
     // 面板输入结束时允许处理剩余的短包。它仍要经过正常的包计数判据，才可能触发完整面板读数。
     /// <summary>At WAV EOF the original Panel processes the final short input report.</summary>
-    public void CompleteInput()
+    public void CompleteInput() => CompleteInput(null);
+
+    internal void CompleteInput(Action<StreamingBenchReading>? report)
     {
-        if (_packetsPerReading > 1 && _pendingCount > 0)
-            ProcessPendingPacket();
+        if (_transportClock && _pendingCount > 0)
+            ProcessPendingPacket(report);
     }
 
     // 在包边界应用待定配置，再处理当前实际点数。达到设定包数才发布，然后计算下一包长度。
-    private void ProcessPendingPacket()
+    private void ProcessPendingPacket(Action<StreamingBenchReading>? report)
     {
         if (_pendingPanelConfiguration is { } pending)
         {
@@ -354,8 +432,31 @@ public sealed class StreamingBenchPipeline
             ApplyConfiguration(pending.Filter, pending.Gain1Db, pending.Gain2Db, pending.GeneratorHz);
             _pendingPanelConfiguration = null;
         }
+        if (_pendingReadingRateHz is double rate)
+        {
+            _pendingReadingRateHz = null;
+            if (rate != _readingRateHz)
+            {
+                _readingRateHz = rate;
+                _packetsPerReading = (int)Math.Ceiling(1000 / rate);
+                _packetCount = 0;
+                _weightedRms1.SetReadingRate(rate);
+                _weightedRms2.SetReadingRate(rate);
+                _acRms1.SetReadingRate(rate);
+                _acRms2.SetReadingRate(rate);
+                _bpRms1.SetReadingRate(rate);
+                _bpRms2.SetReadingRate(rate);
+                _residual1.SetReadingRate(rate);
+                _residual2.SetReadingRate(rate);
+                _imd.SetReadingRate(rate);
+            }
+        }
         ProcessPacket(_pendingCount);
-        if (++_packetCount == _packetsPerReading) PublishReading();
+        if (++_packetCount == _packetsPerReading)
+        {
+            PublishReading();
+            report?.Invoke(Latest!);
+        }
         _pendingCount = 0;
         _packetSize = NextPacketSize();
     }
@@ -399,6 +500,9 @@ public sealed class StreamingBenchPipeline
             if (ar > _rawPeak2) _rawPeak2 = ar;
         }
 
+        // 1b. APxRT SetEqFilter 原生双槽位 IIR 输入均衡（位于频率/相位检测与主带宽滤波之前，APxRT.c 8263-8282）
+        _inputEq.ProcessInPlace(workL, workR);
+
         // 2. 交流参考支路
         // 同一份输入分两路。交流副本用于寻找过零和测交流参考，原样本留给主路径。
         // 若在分路前减掉每帧均值，直流档的恒定输入也会被消掉。
@@ -422,42 +526,41 @@ public sealed class StreamingBenchPipeline
         _phase1.ProcessBlock(acL, SampleRate, _prevPeak1);
         _phase2.ProcessBlock(acR, SampleRate, _prevPeak2);
 
-        // 3. 特殊交流耦合档复用交流参考波形。软件 Butterworth 路径按 APxRT 顺序，先低通再高通。
-        // 主路可选专用交流耦合，随后先低通、再按需高通，最后计权。交流 RMS/过零分支已经在前面独立取样。
-        bool useAcCoupling = UseAcCoupling;
+        // 3. 特殊交流耦合档复用交流参考波形。软件路径按 APxRT 顺序：先低通、再高通、最后计权，均支持分声道开关。
+        bool useAcCoupling = UseAcCoupling && _highPassType == HighPassFilterType.Butterworth4;
         if (useAcCoupling)
         {
-            acL.CopyTo(workL);
-            acR.CopyTo(workR);
+            if (_hpOn1) acL.CopyTo(workL);
+            if (_hpOn2) acR.CopyTo(workR);
         }
-        _lp1.ProcessInPlace(workL);
-        _lp2.ProcessInPlace(workR);
+        if (_lpOn1) _lp1.ProcessInPlace(workL);
+        if (_lpOn2) _lp2.ProcessInPlace(workR);
         if (_highPassHz > 0.0 && !useAcCoupling)
         {
-            _hp1.ProcessInPlace(workL);
-            _hp2.ProcessInPlace(workR);
+            if (_hpOn1) _hp1.ProcessInPlace(workL);
+            if (_hpOn2) _hp2.ProcessInPlace(workR);
         }
 
-        // 4. APxRT 把计权写回主波形，带通和主电平都从这一步的结果取样。
-        _wt1.ProcessInPlace(workL);
-        _wt2.ProcessInPlace(workR);
+        // 4. APxRT 把计权写回主波形，带通、主电平和实时 IMD 都从这一步的结果取样。
+        if (_wtOn1) _wt1.ProcessInPlace(workL);
+        if (_wtOn2) _wt2.ProcessInPlace(workR);
 
-        // 从同一计权波形复制出带通分支，单独读窄带电平；后续宽带和残余仪表继续使用原主路数据。
+        // 从同一计权波形复制出带通分支，单独读窄带电平；后续宽带、IMD 和残余仪表继续使用原主路数据。
         _bp1.Process(workL, bandpassL);
         _bp2.Process(workR, bandpassR);
         _bpRms1.Process(bandpassL);
         _bpRms2.Process(bandpassR);
 
-        // 5. 主路径连续 RMS 检波
-        // 主路 RMS、DC 和峰值必须在破坏性陷波前送入检波器，后续残余路径会覆盖工作区。
+        // 5. 主路径连续 RMS、DC/峰值与实时 IMD 检波（必须在破坏性陷波覆盖工作区之前消费）
         _weightedRms1.Process(workL);
         _weightedRms2.Process(workR);
         _dc1.Process(workL);
         _dc2.Process(workR);
+        if (_enableRealtimeImd) _imd.Process(workL, workR);
         // Residual processing may overwrite the main buffer. All other detectors
         // have consumed it, and tuning still uses the previous published frequency.
-        _residual1.Process(workL, NotchCenter(Latest?.Phase.Ch1FrequencyHz ?? 0), _residualWeighting, _highPassHz <= 0);
-        _residual2.Process(workR, NotchCenter(Latest?.Phase.Ch2FrequencyHz ?? 0), _residualWeighting, _highPassHz <= 0);
+        _residual1.Process(workL, NotchCenter(Latest?.Phase.Ch1FrequencyHz ?? 0), _residualWeighting, _highPassHz <= 0 || !_hpOn1);
+        _residual2.Process(workR, NotchCenter(Latest?.Phase.Ch2FrequencyHz ?? 0), _residualWeighting, _highPassHz <= 0 || !_hpOn2);
     }
 
     // 固定、实测和发生器模式分别给陷波器不同的中心 Hz；实测来自上次发布的频率。
@@ -481,6 +584,7 @@ public sealed class StreamingBenchPipeline
         var (dc2, peak2) = _dc2.Read();
         double residual1 = _residual1.Read();
         double residual2 = _residual2.Read();
+        var (imd1, imd2) = _enableRealtimeImd ? _imd.Read() : (double.NaN, double.NaN);
         // 先记住本报告真正使用的带通中心，随后测得的新频率仅调谐未来样本。
         double measuredCenter1 = _activeBpCenter1, measuredCenter2 = _activeBpCenter2;
 
@@ -511,7 +615,7 @@ public sealed class StreamingBenchPipeline
 
         (double Ch1, double Ch2)? panelPhaseDegrees = null;
         // 面板的指定参考声道显示为零，另一声道的交越秒差乘该参考声道的频率。
-        if (ReadingsPerSecond == PanelReadingsPerSecond)
+        if (_transportClock)
         {
             // The selected reference supplies both the crossing and frequency.
             // For unequal channel frequencies the two reference choices are not opposites.
@@ -521,12 +625,12 @@ public sealed class StreamingBenchPipeline
         }
 
         // 此次读数区分主路加权 RMS、专用交流 RMS、带通 RMS 与滤后 DC，名称相近但取样位置不同。
-        LatestPhaseReading = new ApxRealtimeReading(phaseReading, _processedSamples, SampleRate, ReadingsPerSecond);
+        LatestPhaseReading = new ApxRealtimeReading(phaseReading, _processedSamples, SampleRate, _readingRateHz);
         Latest = new StreamingBenchReading(
             Phase: phaseReading,
             EndSampleIndex: _processedSamples,
             SampleRate: SampleRate,
-            ReadingRateHz: ReadingsPerSecond,
+            ReadingRateHz: _readingRateHz,
             WeightedCh1RmsLinear: wRms1,
             WeightedCh2RmsLinear: wRms2,
             AcCh1RmsLinear: acRms1,
@@ -543,17 +647,20 @@ public sealed class StreamingBenchPipeline
             BandpassCh1RmsLinear: bpRms1,
             BandpassCh2RmsLinear: bpRms2)
         {
+            ReportSampleCount = _readingSampleCount,
             PanelPhaseDegrees = panelPhaseDegrees,
             BandpassCh2CenterHz = measuredCenter2,
-            BandpassRecordCh1Rms = BandpassRecordRms(_bpL),
-            BandpassRecordCh2Rms = BandpassRecordRms(_bpR),
+            BandpassRecordCh1Rms = BandpassRecordRms(_bpL.AsSpan(0, Math.Min(_readingSampleCount, _bpL.Length))),
+            BandpassRecordCh2Rms = BandpassRecordRms(_bpR.AsSpan(0, Math.Min(_readingSampleCount, _bpR.Length))),
             BandpassInput = new(_highPassHz, _lowPassHz, _lowPassType, _bpSelectivity, _bpTuneMode, _weighting),
             FilteredCh1DcFs = dc1,
             FilteredCh2DcFs = dc2,
             FilteredCh1Peak = peak1,
             FilteredCh2Peak = peak2,
             Ch1ResidualRms = residual1,
-            Ch2ResidualRms = residual2
+            Ch2ResidualRms = residual2,
+            Ch1ImdRatio = imd1,
+            Ch2ImdRatio = imd2
         };
         // 报告发布后清除本轮样本计数、直流求和与峰值，滤波器和交越计数器继续沿用其自身历史。
         _packetCount = _readingSampleCount = 0;
@@ -563,9 +670,12 @@ public sealed class StreamingBenchPipeline
     // Sequence's Level worksheet receives the filtered acquisition; Bench's RMS
     // detector additionally retains its envelope across acquisitions and retunes.
     // 对常规包的带通波形单独计算窗加权交流 RMS。未建立记录窗时用 NaN 表示该项不可用。
-    private double BandpassRecordRms(double[] samples)
+    private double BandpassRecordRms(ReadOnlySpan<double> samples)
     {
-        if (_bandpassRecordWindow is not { } window) return double.NaN;
+        var window = samples.Length == _basePacketSize
+            ? _bandpassRecordWindow
+            : samples.Length == _basePacketSize + 1 ? _bandpassRecordWindowPlusOne : null;
+        if (window is null) return double.NaN;
         var w = window.Coefficients;
         double mean = 0;
         // 先按窗系数和求直流并减去，再按窗平方和归一功率，开方得到与输入同单位的有效值。
@@ -606,6 +716,7 @@ public sealed record StreamingBenchReading(
     double BandpassCh1RmsLinear,
     double BandpassCh2RmsLinear)
 {
+    public int ReportSampleCount { get; init; }
     public (double Ch1, double Ch2)? PanelPhaseDegrees { get; init; }
     public double BandpassCh2CenterHz { get; init; } = BandpassCenterHz;
     public BandpassInputSettings? BandpassInput { get; init; }
@@ -652,4 +763,31 @@ public sealed record StreamingBenchReading(
 
     public double FilteredCh1DcFs { get; init; }
     public double FilteredCh2DcFs { get; init; }
+    public double Ch1ImdRatio { get; init; } = double.NaN;
+    public double Ch2ImdRatio { get; init; } = double.NaN;
+
+    /// <summary>当实时流开启了明确标准（SMPTE / DFD / CCIF / DIM）的 APxRT 时域 IMD 检波时，用连续检波结果覆盖快照 IMD。</summary>
+    public ImdResult? ApplyRealtimeImd(ImdResult? snapshot, ImdMeasurementStandard standard)
+    {
+        if (standard is not (ImdMeasurementStandard.Smpte or ImdMeasurementStandard.Dfd
+            or ImdMeasurementStandard.Ccif or ImdMeasurementStandard.DimEmulation))
+            return snapshot;
+        if (!double.IsFinite(Ch1ImdRatio) && !double.IsFinite(Ch2ImdRatio))
+            return snapshot;
+        string tag = standard switch
+        {
+            ImdMeasurementStandard.Smpte => "SMPTE (RT)",
+            ImdMeasurementStandard.Dfd => "DFD (RT)",
+            ImdMeasurementStandard.Ccif => "CCIF (RT)",
+            ImdMeasurementStandard.DimEmulation => "DIM (RT)",
+            _ => standard.ToString()
+        };
+        static ImdChannelResult Channel(double ratio, ImdChannelResult? fallback, string label) =>
+            double.IsFinite(ratio)
+                ? new ImdChannelResult(true, label, ratio * 100.0, 20.0 * Math.Log10(Math.Max(ratio, 1e-9)))
+                : (fallback ?? new ImdChannelResult(false, label, double.NaN, double.NaN, "No valid RT IMD"));
+        return new ImdResult(
+            Channel(Ch1ImdRatio, snapshot?.Ch1, tag),
+            Channel(Ch2ImdRatio, snapshot?.Ch2, tag));
+    }
 }

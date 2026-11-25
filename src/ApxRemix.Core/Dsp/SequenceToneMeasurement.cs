@@ -69,6 +69,20 @@ public static class SequenceToneMeasurement
             inputWeighting, residualWeighting, windowType, digital, dcCoupled, bandwidthFraction, frequencyHintHz,
             fixedNotchHz, maxHarmonic, weighting, residualLowpassHz, excludeNyquist: false);
 
+    // Fast Sweep 的 Hann 窗覆盖实测切片全长。稳态和失真切片都可能是奇数点。
+    internal static SequenceToneReading AnalyzeFastSweepSlice(ReadOnlySpan<double> samples, int sampleRate, double frequencyHz)
+    {
+        bool previous = SequenceBinEstimator.DesktopWorksheet;
+        SequenceBinEstimator.DesktopWorksheet = true;
+        try
+        {
+            return AnalyzeCore(samples, sampleRate, 0, 0, 0, AnalyzerWeighting.Flat, AnalyzerWeighting.Flat,
+                FftWindowType.Hann, true, true, 1, frequencyHz, null, 200, AnalyzerWeighting.Flat, 0,
+                excludeNyquist: false, allowOddLength: true);
+        }
+        finally { SequenceBinEstimator.DesktopWorksheet = previous; }
+    }
+
     // 先在整段记录中找出基波的位置，再从基波以外的分量估计失真和噪声。
     // N 个样本占 N/Fs 秒。频率为 f 的音在这段时间走过 f·N/Fs 个周期，
     // 这个数也是它在 FFT 频率轴上的位置。例如 Fs=48 kHz、N=4,800 时，1 kHz 恰好落在第 100 格。
@@ -76,11 +90,12 @@ public static class SequenceToneMeasurement
         double inputHighpassHz, double inputButterworthLowpassHz, double inputAes17LowpassHz,
         AnalyzerWeighting inputWeighting, AnalyzerWeighting residualWeighting, FftWindowType windowType,
         bool digital, bool dcCoupled, double bandwidthFraction, double? frequencyHintHz, double? fixedNotchHz,
-        int maxHarmonic, AnalyzerWeighting weighting, double residualLowpassHz, bool excludeNyquist)
+        int maxHarmonic, AnalyzerWeighting weighting, double residualLowpassHz, bool excludeNyquist, bool allowOddLength = false)
     {
         // 偶数帧便于定位奈奎斯特端点；频率提示和陷波中心都必须落在可表达的频率范围。
         int n = samples.Length;
-        if (n < 16 || n % 2 != 0) throw new ArgumentException("需要至少 16 个样本且帧长为偶数。", nameof(samples));
+        if (n < 16) throw new ArgumentException("需要至少 16 个样本。", nameof(samples));
+        if (!allowOddLength && n % 2 != 0) throw new ArgumentException("需要偶数帧长。", nameof(samples));
         if (!(double.IsFinite(sampleRate) && sampleRate > 0)) throw new ArgumentOutOfRangeException(nameof(sampleRate));
         if (!(bandwidthFraction > 0 && bandwidthFraction <= 1)) throw new ArgumentOutOfRangeException(nameof(bandwidthFraction));
         if (maxHarmonic < 2 || maxHarmonic > 1024) throw new ArgumentOutOfRangeException(nameof(maxHarmonic));
@@ -266,6 +281,111 @@ public static class SequenceToneMeasurement
         if (ReferenceEquals(channel, reference) || channel.IsNoise || !(Math.Abs(channel.FrequencyHz / reference.FrequencyHz - 1) < 0.001)) return double.NaN;
         double turns = (channel.PhaseRadians - reference.PhaseRadians) / (2 * Math.PI);
         return 360 * (turns - Math.Floor(turns + 0.5));
+    }
+
+    /// <summary>分析普通 Sequence 相位页使用的同一帧双通道 PCM，返回两个参考方向及下一帧长度。</summary>
+    public static (double LeftDegrees, double RightDegrees, double LeftFrequencyHz, double RightFrequencyHz, int NextLength)
+        AnalyzeInterchannelPhase(ReadOnlySpan<double> left, ReadOnlySpan<double> right, int sampleRate)
+    {
+        if (left.Length < 16 || left.Length != right.Length)
+            throw new ArgumentException("Phase requires two equal-length input records of at least 16 samples.");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sampleRate);
+
+        int length = left.Length;
+        bool previous = SequenceBinEstimator.DesktopWorksheet;
+        SequenceBinEstimator.DesktopWorksheet = true;
+        try
+        {
+            var window = SequenceFftWindow.Get(length, FftWindowType.BlackmanHarris);
+            var first = PhaseChannel(left, window);
+            var second = PhaseChannel(right, window);
+            // AcqLen uses the integer peak and requires two window half-widths for phase.
+            int minimumBin = 2 * window.HalfWidth;
+            int lowest = Math.Min(first.Noise ? int.MaxValue : first.Peak, second.Noise ? int.MaxValue : second.Peak);
+            int maximumLength = SequenceTransform.NextLength((int)((minimumBin + 1) / 5.0 * sampleRate), allowShort: true);
+            int nextLength = lowest == int.MaxValue ? (int)Math.Ceiling(0.05 * sampleRate)
+                : Math.Min(maximumLength, lowest < minimumBin ? length * 4
+                    : SequenceTransform.NextLength(Math.Max(1024, length * minimumBin / lowest), allowShort: true));
+            double leftCycles = first.Bin / length, rightCycles = second.Bin / length;
+            return (PhaseDifference(first.Angle, leftCycles, first.Noise, second.Angle, rightCycles),
+                PhaseDifference(second.Angle, rightCycles, second.Noise, first.Angle, leftCycles),
+                first.Bin * ((double)sampleRate / length), second.Bin * ((double)sampleRate / length), nextLength);
+        }
+        finally { SequenceBinEstimator.DesktopWorksheet = previous; }
+    }
+
+    private static (int Peak, double Bin, double Angle, bool Noise) PhaseChannel(ReadOnlySpan<double> samples, SequenceFftWindow window)
+    {
+        var spectrum = window.Transform(samples);
+        window.SubtractDc(spectrum);
+        var power = SequenceFftWindow.Power(spectrum, samples.Length, spectrum.Length);
+        int peak = 0;
+        for (int k = 1; k < power.Length; k++)
+            if (power[k] > power[peak]) peak = k;
+
+        int width = window.HalfWidth;
+        double bin = SequenceTransform.Centroid(power, peak, width);
+        bin -= CentroidBias(bin - peak);
+        if (!double.IsFinite(bin)) return (peak, bin, double.NaN, true);
+        double amplitude = Math.Sqrt(Band(power, (int)Math.Round(bin), width));
+        // XfrmObj keeps the unmasked spectrum for phase. Only its noise estimate masks edge bins and 19 harmonics.
+        Array.Clear(power, 0, width);
+        Array.Clear(power, power.Length - width, width);
+        for (int order = 1; order < 20; order++)
+        {
+            int center = (int)Math.Round(bin * order);
+            int first = Math.Max(0, center - width);
+            int last = Math.Min(power.Length - 1, center + width);
+            if (first <= last) Array.Clear(power, first, last - first + 1);
+        }
+        double noisePower = 0, increment = 1.0 / (power.Length - 1);
+        for (int k = 0; k < power.Length; k++) noisePower += power[k] * (k * increment);
+        bool noise = !(amplitude > 0 && Math.Sqrt(noisePower) / amplitude <= 0.25);
+        return (peak, bin, ComputePhaseCore(spectrum, bin), noise);
+    }
+
+    private static double PhaseDifference(double angle, double cycles, bool noise, double referenceAngle, double referenceCycles)
+    {
+        if (noise || !(Math.Abs((cycles - referenceCycles) / referenceCycles) < 0.001)) return double.NaN;
+        double difference = angle - referenceAngle;
+        if (difference < -Math.PI) difference += 2 * Math.PI;
+        if (difference >= Math.PI) difference -= 2 * Math.PI;
+        return difference * (180.0 / Math.PI);
+    }
+
+    /// <summary>
+    /// 对齐 APx500 <c>PhaseMath.PhaseCore(double[] xfrm, double freq)</c>：按分数频格偏移执行半周期复数旋转求相位（弧度）。
+    /// </summary>
+    public static double ComputePhaseCore(ReadOnlySpan<System.Numerics.Complex> spectrum, double fractionalBin)
+    {
+        if (spectrum.IsEmpty || !double.IsFinite(fractionalBin) || fractionalBin < 0.0 || fractionalBin >= spectrum.Length)
+            return double.NaN;
+        int bin = (int)Math.Floor(fractionalBin);
+        double angle = (fractionalBin - bin) * Math.PI;
+        double cos = Math.Cos(angle);
+        double sin = Math.Sin(angle);
+        double re = spectrum[bin].Real;
+        double im = spectrum[bin].Imaginary;
+        double num = cos * re + sin * im;
+        double den = sin * re - cos * im;
+        return den != 0.0 ? Math.Atan2(num, den) : double.NaN;
+    }
+
+    /// <summary>对齐 APx500 <c>PhaseMath.Unwrap</c>（默认阈值 180°）。</summary>
+    public static double[] UnwrapPhases(ReadOnlySpan<double> phases, double threshold = 180.0)
+    {
+        if (phases.IsEmpty) return [];
+        var output = new double[phases.Length];
+        double invTwoThreshold = 1.0 / (2.0 * threshold);
+        output[0] = phases[0];
+        for (int i = 1; i < phases.Length; i++)
+        {
+            double delta = phases[i] - output[i - 1];
+            output[i] = Math.Abs(delta) > threshold
+                ? phases[i] - Math.Round(delta * invTwoThreshold) * (2.0 * threshold)
+                : phases[i];
+        }
+        return output;
     }
 
     // 从所有可用单音中取最低频，决定下一次需要的采样点数，兼顾低频主瓣及陷波的宽度。

@@ -99,7 +99,7 @@ public sealed record StereoSweepDrive(double[] Left,double[] Right,bool LeftEnab
                     bool ap = cfg.ChirpType == ContinuousChirpType.ApChirp;
                     double start = Math.Clamp(cfg.StartFrequencyHz,5,rate*.40);
                     double stop = Math.Max(start+10,ContinuousSweepAnalyzer.CheckStopFrequency(cfg.StopFrequencyHz,rate));
-                    if (ap) stop = Math.Min(rate*.49, stop*1.05);
+                    stop = ap ? Math.Min(rate*.49, stop*1.05) : ContinuousSweepAnalyzer.LogChirpEndFrequency(start, stop, rate);
                     double logRate = Math.Log(stop/start)/duration;
                     double hz = start * Math.Exp(logRate * (ap ? -Math.Min(.05,duration*.1) : 0));
                     double step = Math.Exp(logRate/rate);

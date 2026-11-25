@@ -61,6 +61,8 @@ public sealed partial class SignalGeneratorDsp
 
     public bool OneShotCh1Enabled { get { lock (_oneShotLock) return _oneShotEnableCh1; } }
     public bool OneShotCh2Enabled { get { lock (_oneShotLock) return _oneShotEnableCh2; } }
+    public double OneShotPeak { get { lock (_oneShotLock) return _oneShotPeak; } }
+    private double _oneShotPeak = 1.0;
 
     /// <summary>排入一段一次性激励波形（含前后静音保护带与独立通道使能），播放结束后保持静音直到调用 <see cref="ClearOneShot"/>。</summary>
     public void EnqueueOneShot(
@@ -78,6 +80,12 @@ public sealed partial class SignalGeneratorDsp
         int delay = Math.Max(0, secondChannelDelaySamples);
         var buf = new double[checked(pre + monoSamples.Length + post + delay)];
         Array.Copy(monoSamples, 0, buf, pre, monoSamples.Length);
+        double peak = 0.0;
+        for (int i = 0; i < monoSamples.Length; i++)
+        {
+            double a = Math.Abs(monoSamples[i]);
+            if (a > peak) peak = a;
+        }
         double[]? right = null;
         // 若两路共享同一源数组，右路可按延时读取公共缓冲。独立右路必须与左路等长，才能沿同一游标输出。
         if (secondChannelSamples != null && !ReferenceEquals(secondChannelSamples, monoSamples))
@@ -85,6 +93,11 @@ public sealed partial class SignalGeneratorDsp
             if (secondChannelSamples.Length != monoSamples.Length) throw new ArgumentException("Sweep output lengths differ.");
             right = new double[buf.Length];
             Array.Copy(secondChannelSamples, 0, right, pre, secondChannelSamples.Length);
+            for (int i = 0; i < secondChannelSamples.Length; i++)
+            {
+                double a = Math.Abs(secondChannelSamples[i]);
+                if (a > peak) peak = a;
+            }
         }
         lock (_oneShotLock)
         {
@@ -94,6 +107,7 @@ public sealed partial class SignalGeneratorDsp
             _oneShotCursor = 0;
             _oneShotEnableCh1 = enableCh1;
             _oneShotEnableCh2 = enableCh2;
+            _oneShotPeak = peak > 1e-6 ? peak : 1.0;
         }
     }
 
@@ -108,6 +122,7 @@ public sealed partial class SignalGeneratorDsp
             _oneShotCursor = 0;
             _oneShotEnableCh1 = true;
             _oneShotEnableCh2 = true;
+            _oneShotPeak = 1.0;
         }
     }
 

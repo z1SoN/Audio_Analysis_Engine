@@ -10,12 +10,21 @@ public sealed class ApxRmsDetector
 {
     private double _power, _z1, _z2, _post, _sum;
     private int _count;
-    private readonly double _powerK, _powerA, _b0, _b1, _a1, _a2, _postK, _postA;
+    private readonly int _sampleRate;
+    private double _powerK, _powerA, _b0, _b1, _a1, _a2, _postK, _postA;
 
     // 这里建立数字检波器的时间常数。Fs 控制每个样本的步进量，报告速率选择快慢参数组。
     public ApxRmsDetector(int sampleRate, double readingsPerSecond = 20)
     {
-        double fs = Math.Max(1000, sampleRate);
+        _sampleRate = Math.Max(1000, sampleRate);
+        SetReadingRate(readingsPerSecond);
+    }
+
+    // APxRT retunes the RMS coefficients at a reading-rate change while
+    // retaining the detector's delays and accumulated report samples.
+    internal void SetReadingRate(double readingsPerSecond)
+    {
+        double fs = _sampleRate;
         bool slow = readingsPerSecond < 32;
         double c = slow ? 2e-6 : 1e-6;
         double r = slow ? 27000 : 4000;

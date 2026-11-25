@@ -83,9 +83,9 @@ public sealed class VirtualAudioEngine : IAudioEngine
 
             var outL = new double[blockSize];
             var outR = new double[blockSize];
-            // 模型使用参考峰值描述常规发生器的幅度尺度，取 10^(dBFS/20)。一次性激励直接提供已成形的序列，此处分配单位尺度。
+            // 模型使用参考峰值描述常规发生器的幅度尺度，取 10^(dBFS/20)。一次性激励采用已入队波形的实际峰值，避免低电平扫频被 1.0 FS 基准注入大直流偏置。
             double refPeak = _generator.IsOneShotOwned
-                ? 1.0
+                ? _generator.OneShotPeak
                 : (genSnapshot.IsEnabled ? SignalGeneratorDsp.DbfsToLinearPeak(genSnapshot.LevelDbfs) : 0.0);
 
             _dutProcessor.ProcessBlock(dutSnapshot, refPeak, sampleRate, srcL, srcR, outL, outR);

@@ -60,13 +60,17 @@ public static class BenchFastSweep
         // 参考文件与新生成的激励起点之差修正前导静音；录到的输出还需另外加上反卷积得到的通道延时。
         int origin = Onset(reference) - Onset(excitation.Samples);
         var slices = FastSweepGenerator.AcquisitionSlices(plan, rate, excitation.Samples.Length, 0, false);
+        var distSlices = config.FastSweep.MeasureThdn
+            ? FastSweepGenerator.AcquisitionSlices(plan, rate, excitation.Samples.Length, 0, true)
+            : null;
         double calibration = AudioMetricsAnalyzer.ComputeCalibrationGainOffsetDb(config.InputFullScaleVoltageVrms, config.OutputFullScaleVoltageVrms);
         List<FrequencyResponsePoint> levels = [], thd = [], thdn = [];
         double previousResidual = double.NaN;
         var orders = config.ExtractHarmonics ? Enumerable.Range(2, 19)
             .ToDictionary(order => order, _ => Enumerable.Repeat(double.NaN, slices.Length).ToArray()) : null;
-        foreach (var slice in slices)
+        for (int idx = 0; idx < slices.Length; idx++)
         {
+            var slice = slices[idx];
             int r = origin + slice.Start, y = r + delay;
             // 只有参考和响应都覆盖完整测量段时才取数，一个越界切片会把别的频点误当成本点。
             if (r < 0 || y < 0 || slice.Count < 64 || slice.Count > reference.Length - r || slice.Count > recording.Length - y)
@@ -96,19 +100,39 @@ public static class BenchFastSweep
             double level = output.LevelDbfs;
             var point = new FrequencyResponsePoint(hz, level, level, gain, gain, 0, 0, phase, phase, phase, XValue: hz,
                 IsValid: output.LevelDbfs > -150, ExcitationToneDbfs: input.LevelDbfs);
-            if (orders is not null && point.IsValid)
-                ChirpResultMath.FastProducts(measured, hz, rate, levels.Count, orders);
             levels.Add(point);
-            // 固定本段的已知 Hz 拟合基波，THD 取分离出的谐波，启用 THD+N 时另外保存含噪残余的比值和绝对电平。
             if (config.ExtractHarmonics || config.FastSweep.MeasureThdn)
             {
-                var d = AudioMetricsAnalyzer.AnalyzeThdPlusN(measured, measured, rate, hz, strictFixedNotch: true).Ch1;
-                bool hasHarmonics = d.HasValidSignal && d.Harmonics.Count != 0;
-                thd.Add(point with { IsValid = hasHarmonics, Ch1ThdNPercent = hasHarmonics ? d.ThdRatioPercent : double.NaN,
-                    Ch1ThdNDb = hasHarmonics ? d.ThdRatioDb : double.NaN });
-                if (config.FastSweep.MeasureThdn)
-                    thdn.Add(point with { IsValid = d.HasValidSignal, Ch1ThdNPercent = d.ThdNRatioPercent, Ch1ThdNDb = d.ThdNRatioDb,
-                        Ch1LevelDbfs = d.ThdNLevelDbfs });
+                var harmonicReading = SequenceToneMeasurement.AnalyzeFastSweepSlice(measured, rate, hz);
+                if (distSlices is not null)
+                {
+                    var ds = distSlices[idx];
+                    int start = Math.Clamp(origin + ds.Start + delay, 0, recording.Length - 7);
+                    int available = Math.Min(ds.Count, recording.Length - start);
+                    var samples = recording.Slice(start, available);
+                    if (available < ds.Count)
+                    {
+                        var padded = new double[ds.Count];
+                        samples.CopyTo(padded);
+                        samples = padded;
+                    }
+                    var residualReading = SequenceToneMeasurement.AnalyzeFastSweepSlice(samples, rate, hz);
+                    // 原版在两组谐波中选择总幅度较小的一整组，THD+N 始终取失真专用窗。
+                    if (residualReading.HarmonicLevels.Sum() < harmonicReading.HarmonicLevels.Sum())
+                        harmonicReading = residualReading;
+                    double ratio = residualReading.ThdNRatio;
+                    thdn.Add(point with { IsValid = point.IsValid && double.IsFinite(ratio),
+                        Ch1ThdNPercent = 100 * ratio, Ch1ThdNDb = 20 * Math.Log10(ratio),
+                        Ch1LevelDbfs = 20 * Math.Log10(residualReading.ThdNLevel) });
+                }
+                bool hasHarmonics = point.IsValid && 2 * hz < rate * 0.5 && double.IsFinite(harmonicReading.ThdRatio);
+                double thdRatio = hasHarmonics ? harmonicReading.ThdRatio : double.NaN;
+                thd.Add(point with { IsValid = hasHarmonics, Ch1ThdNPercent = 100 * thdRatio,
+                    Ch1ThdNDb = 20 * Math.Log10(thdRatio) });
+                if (orders is not null && hasHarmonics)
+                    foreach (var (order, values) in orders)
+                        if (order * hz < rate * 0.5)
+                            values[idx] = 20 * Math.Log10(harmonicReading.HarmonicLevels[order - 2]);
             }
         }
         // 相对曲线以参考在 1 kHz 对应的响应电平为基准，从有效点按对数频率插值；超出扫频范围则沿用最近端值。

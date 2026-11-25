@@ -46,6 +46,20 @@ public sealed class FrequencyResponseSweeper
         return pts;
     }
 
+    /// <summary>
+    /// APx500 Stepped Sweep 自动读速选择（低频 &lt;15 Hz 降为 4 Hz、中低频 &lt;76 Hz 用 16 Hz、其余 64 Hz，
+    /// 对齐 APx500 <c>SeFA3pkTxV</c>，Om.decompiled.cs:73496-73504），避免低频单周期不足导致 RMS/检波纹波失稳。
+    /// </summary>
+    public static double SelectAutoSteppedReadingRateHz(double frequencyHz) =>
+        frequencyHz < 15.0 ? 4.0 : frequencyHz < 76.0 ? 16.0 : 64.0;
+
+    /// <summary>APx500 <c>OptimumRegulation</c> 极值搜寻入口（最小化或最大化指定测量目标）。</summary>
+    public static OptimumRegulationResult<TZData> RegulateOptimum<TZData>(
+        ApxOptimumRegulator.EvalWithData<TZData> evaluate,
+        double xStart, double xStop, int initialSteps = 10, double absTol = 0.0, double relTol = 0.0001,
+        int measurementsPerPoint = 1, OptimizationObjective objective = OptimizationObjective.Minimize) =>
+        ApxOptimumRegulator.RegulateOptimum(evaluate, xStart, xStop, initialSteps, absTol, relTol, measurementsPerPoint, objective);
+
     // 线性与等比网格按所需点数生成；首选数系列、自定义表的点数由所选区间和实际表项决定。
     public static bool UsesPointCount(SweepSpacingMode spacing) => spacing is SweepSpacingMode.Logarithmic or SweepSpacingMode.Linear;
 
@@ -245,7 +259,13 @@ public sealed class FrequencyResponseSweeper
                 double f = dualTone ? ResolveTonePair(sweepConfig,xVal).Tracking : sweepConfig.AxisType == SweepAxisType.Frequency ? xVal : Math.Clamp(sweepConfig.FixedFrequencyForLevelSweepHz, 5, sampleRate * 0.45);
                 bool regulate = sweepConfig.EnableTargetRegulation && sweepConfig.AxisType == SweepAxisType.Frequency;
                 double genLevel = ClampDriveLevel(sweepConfig, sweepConfig.AxisType == SweepAxisType.Level ? xVal : sweepConfig.SweepLevelDbfs, regulate);
-                int maxRegIters = regulate ? 5 : 1;
+                int searchSteps = regulate ? Math.Clamp(sweepConfig.RegulationSearchSteps ?? 0, 0, 100) : 0;
+                double minDrive = SignalGeneratorDsp.DbfsToLinearPeak(sweepConfig.RegulationMinGeneratorDbfs);
+                double maxDrive = SignalGeneratorDsp.DbfsToLinearPeak(sweepConfig.RegulationMaxGeneratorDbfs);
+                double? thdnTarget = regulate ? sweepConfig.TargetRegulatedThdnPercent : null;
+                if (searchSteps > 0 && thdnTarget.HasValue) genLevel = sweepConfig.RegulationMinGeneratorDbfs;
+                int maxRegIters = searchSteps > 0 ? searchSteps + 2 + 32 : regulate ? 5 : 1;
+                double targetDb = thdnTarget is double percent ? 20 * Math.Log10(percent / 100) : sweepConfig.TargetRegulatedLevelDbfs;
                 double tol = Math.Max(0.02, sweepConfig.RegulationToleranceDb);
 
                 AudioCaptureSnapshot snap = default!;
@@ -258,6 +278,9 @@ public sealed class FrequencyResponseSweeper
                 RegulationOutcome regOutcome = regulate ? RegulationOutcome.NotConverged : RegulationOutcome.NotRequested;
                 double regErrorDb = 0.0;
                 bool hitClampLimit = false;
+                int gridIndex = 0;
+                (double Drive, double Error)? lower = null, upper = null;
+                BenchMeterSnapshot? regulationMeters = null;
 
                 // 每次调节都重新发出激励并等待新数据。沿用上一轮样本会让反馈重复校正同一个过期误差。
                 for (int iter = 0; iter < maxRegIters; iter++)
@@ -295,12 +318,59 @@ public sealed class FrequencyResponseSweeper
                         break;
 
                     // 误差统一定义为 (实测 - 目标)：负值代表实测低于目标，正值代表高于目标
-                    regErrorDb = trackedDb - sweepConfig.TargetRegulatedLevelDbfs;
+                    if (thdnTarget.HasValue)
+                    {
+                        var drive = CreateDrive(sweepConfig, f, xVal, actualIssuedLevel, dualTone, originalGenerator);
+                        regulationMeters = AudioMetricsAnalyzer.AnalyzeBenchSnapshot(snap.Left, snap.Right, sampleRate, drive,
+                            sweepConfig.AnalyzerFilter ?? new(), sweepConfig.InputFullScaleVoltageVrms, sweepConfig.OutputFullScaleVoltageVrms);
+                        var ch = trackCh2 ? regulationMeters.ThdPlusN.Ch2 : regulationMeters.ThdPlusN.Ch1;
+                        if (!ch.HasValidSignal || !double.IsFinite(ch.ThdNRatioDb))
+                            throw new SweepMeasurementException($"No valid THD+N reading on {(trackCh2 ? "Ch2" : "Ch1")} at {f:F1} Hz.");
+                        trackedDb = ch.ThdNRatioDb;
+                    }
+                    regErrorDb = trackedDb - targetDb;
                     // 误差以 dB 表示。若通路在本次调节附近近似线性，输入比目标高 2 dB，就把激励降低 2 dB，再采一轮验证。
                     if (Math.Abs(regErrorDb) <= tol)
                     {
                         regOutcome = RegulationOutcome.Converged;
                         break;
+                    }
+
+                    if (searchSteps > 0)
+                    {
+                        // APx starts with an amplitude grid and refines a bracket using linear readings.
+                        double amplitude = SignalGeneratorDsp.DbfsToLinearPeak(actualIssuedLevel);
+                        double linearError = Math.Pow(10, trackedDb / 20) - Math.Pow(10, targetDb / 20);
+                        if (linearError < 0) lower = (amplitude, linearError);
+                        else upper = (amplitude, linearError);
+                        if (lower is { } below && upper is { } above)
+                        {
+                            double left = Math.Min(below.Drive, above.Drive);
+                            double right = Math.Max(below.Drive, above.Drive);
+                            double crossing = below.Drive - below.Error * (above.Drive - below.Drive) / (above.Error - below.Error);
+                            double margin = (right - left) * 0.05;
+                            double next = Math.Clamp(crossing, left + margin, right - margin);
+                            if (next == amplitude || right - left <= 1e-12) break;
+                            genLevel = 20 * Math.Log10(next);
+                        }
+                        else if (!thdnTarget.HasValue && iter == 0)
+                        {
+                            // Use the existing nominal level as the first RMS reading. At ordinary gains this
+                            // estimates the crossing without starting with a tone below the analyzer floor.
+                            genLevel = ClampDriveLevel(sweepConfig, actualIssuedLevel - regErrorDb, true);
+                        }
+                        else if (gridIndex < searchSteps + 1)
+                        {
+                            if (thdnTarget.HasValue && gridIndex == 0) gridIndex = 1; // THD+N already acquired the lower endpoint.
+                            double next = minDrive + (maxDrive - minDrive) * gridIndex++ / searchSteps;
+                            genLevel = 20 * Math.Log10(next);
+                        }
+                        else
+                        {
+                            hitClampLimit = true;
+                            break;
+                        }
+                        continue;
                     }
 
                     double desiredNext = actualIssuedLevel - regErrorDb;
@@ -329,7 +399,7 @@ public sealed class FrequencyResponseSweeper
                     if (sweepConfig.AbortOnRegulationFailure)
                     {
                         throw new SweepMeasurementException(
-                            $"频点 {f:F1} Hz 目标调节未达标（{regOutcome}）：目标 {sweepConfig.TargetRegulatedLevelDbfs:F2} dBFS，实测 {trackedDb:F2} dBFS，发生器 {actualIssuedLevel:F2} dBFS。");
+                            $"频点 {f:F1} Hz 目标调节未达标（{regOutcome}）：目标 {targetDb:F2} {(thdnTarget.HasValue ? "dB" : "dBFS")}，实测 {trackedDb:F2}，发生器 {actualIssuedLevel:F2} dBFS。");
                     }
                 }
 
@@ -370,7 +440,7 @@ public sealed class FrequencyResponseSweeper
                 {
                     var drive = CreateDrive(sweepConfig, f, xVal, actualIssuedLevel, dualTone, originalGenerator);
                     drive.IsEnabled = !sweepConfig.UseExternalFrequency;
-                    meters = AudioMetricsAnalyzer.AnalyzeBenchSnapshot(snap.Left, snap.Right, sampleRate, drive,
+                    meters = regulationMeters ?? AudioMetricsAnalyzer.AnalyzeBenchSnapshot(snap.Left, snap.Right, sampleRate, drive,
                         sweepConfig.AnalyzerFilter ?? new(), sweepConfig.InputFullScaleVoltageVrms, sweepConfig.OutputFullScaleVoltageVrms);
                     if (bandpass is not null) meters = meters with { BandpassLevel = bandpass };
                 }
@@ -407,7 +477,7 @@ public sealed class FrequencyResponseSweeper
                 double toneLevel = sweepConfig.UseExternalFrequency ? double.NaN : actualIssuedLevel + toneOffsetDb;
                 double ch1Gain = ch1HasSignal ? ch1Db - toneLevel + calOffsetDb : double.NaN;
                 double ch2ToneLevel = sweepConfig.UseExternalFrequency ? double.NaN :
-                    (originalGenerator.LinkChannelLevels ? actualIssuedLevel : originalGenerator.EffectiveChannel2LevelDbfs) + toneOffsetDb;
+                    (searchSteps > 0 || originalGenerator.LinkChannelLevels ? actualIssuedLevel : originalGenerator.EffectiveChannel2LevelDbfs) + toneOffsetDb;
                 double ch2Gain = ch2HasSignal ? ch2Db - ch2ToneLevel + calOffsetDb : double.NaN;
                 if (!ch1HasSignal) ch1RelSyncPhase = null;
                 if (!ch2HasSignal) ch2RelSyncPhase = null;
@@ -832,6 +902,7 @@ public sealed class FrequencyResponseSweeper
         drive.SecondaryFrequencyHz = dualTone ? pair.B : frequency;
         drive.DualToneSecondaryRatioDb = pair.RatioDb;
         drive.DualToneMode = DualToneRoutingMode.Sum;
+        if (cfg.EnableTargetRegulation && cfg.RegulationSearchSteps.HasValue) drive.LinkChannelLevels = true;
         if (cfg.AxisType == SweepAxisType.Phase) drive.Channel2PhaseOffsetDeg = x;
         if (cfg.AxisType == SweepAxisType.GeneratorOffset) drive.DcOffsetFs = x;
         drive.LevelDbfs = level;
@@ -849,8 +920,9 @@ public sealed class FrequencyResponseSweeper
 
         // A fractional period leaves a phase-dependent error in the squared-sample
         // average, especially when the tone also carries a DC offset.
-        // 自动窗先决定整数周期数，再换成最接近的整数样本数，以减轻截断小数周期造成的 RMS 偏差。
-        double cycles = Math.Ceiling(Math.Max(0.06, 2048.0 / sampleRate) * frequencyHz);
+        // 自动窗结合 APx 自动读速（4/16/64 Hz）与最小 60 ms / 2048 点约束，按整数周期取整以减轻截断偏差。
+        double autoSeconds = Math.Max(Math.Max(0.06, 2048.0 / sampleRate), 1.0 / SelectAutoSteppedReadingRateHz(frequencyHz));
+        double cycles = Math.Ceiling(autoSeconds * frequencyHz);
         int samples = (int)Math.Round(Math.Max(6, cycles) * sampleRate / frequencyHz);
         return Math.Clamp(samples, 2048, AudioEngineManager.RingCapacity);
     }

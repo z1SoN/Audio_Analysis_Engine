@@ -3,7 +3,7 @@ using ApxRemix.Core.Models;
 
 namespace ApxRemix.Core.Dsp;
 
-public sealed record RubAndBuzzSweep(BenchTrace CrestFactor,BenchTrace PeakRatio);
+public sealed record RubAndBuzzSweep(BenchTrace CrestFactor, BenchTrace PeakRatio, BenchTrace? Loudness = null);
 
 public sealed record RubAndBuzzReading(double[] Filtered, int SkippedSamples, double CrestFactor, double PeakRatio);
 
@@ -75,7 +75,8 @@ public static class RubAndBuzzAnalyzer
         if(reference.Length!=expected) origin+=SweepAlignment.FindDelay(ContinuousSweepAnalyzer.GenerateLogChirp(cfg,rate),reference);
         double start=Math.Clamp(cfg.StartFrequencyHz,5,rate*.4);
         double stop=Math.Clamp(cfg.StopFrequencyHz,start+10,rate*.47);
-        double slope=Math.Log(stop/start)/(rate*duration);
+        double end=ContinuousSweepAnalyzer.LogChirpEndFrequency(start,stop,rate);
+        double slope=Math.Log(end/start)/(rate*duration);
         int first=Math.Max(0,-origin), last=Math.Min(expected,audio.Length-origin);
         // 高通截止会随基波上升。超过可实现的截止上限后缩短分析范围，避免把后半段当作具有相同选择性的测量。
         last=Math.Min(last,(int)Math.Floor(Math.Log(rate*.475/(factor*start))/slope));
@@ -97,9 +98,10 @@ public static class RubAndBuzzAnalyzer
         var hz=new List<double>();
         var crest=new List<double>();
         var ratio=new List<double>();
+        var loudnessPhons=new List<double>();
         foreach(double f in frequencies)
         {
-            // 将请求的测量频率反算为扫频中的时刻，仅用两侧均有足够样本的窗口计算峰值和 RMS。
+            // 将请求的测量频率反算为扫频中的时刻，仅用两侧均有足够样本的窗口计算峰值、RMS 与感知响度。
             if(!double.IsFinite(f) || f<=0) continue;
             int center=(int)Math.Round(Math.Log(f/start)/slope)-first;
             // Use at least one cycle around each frequency, with a sixth-octave
@@ -107,11 +109,35 @@ public static class RubAndBuzzAnalyzer
             // 半窗至少容纳半个周期，另一项对应扫过十二分之一倍频程的点数；左右两侧合起来约覆盖六分之一倍频程。
             int half=Math.Max((int)Math.Ceiling(rate/(2*f)),(int)Math.Round(Math.Log(2)/(12*slope)));
             if(center-half<0 || center+half>=input.Length) continue;
-            var values=MeasureRatios(input.Slice(center-half,2*half+1),residual.AsSpan(center-half,2*half+1));
+            var resSlice = residual.AsSpan(center-half,2*half+1);
+            var values=MeasureRatios(input.Slice(center-half,2*half+1),resSlice);
             hz.Add(f); crest.Add(values.Crest); ratio.Add(values.Ratio);
+            loudnessPhons.Add(ComputeSliceLoudnessPhons(resSlice, rate));
         }
         if(hz.Count==0) return null;
         var x=hz.ToArray();
-        return new(new(x,crest.ToArray()),new(x,ratio.ToArray()));
+        return new(new(x,crest.ToArray()),new(x,ratio.ToArray()),new(x,loudnessPhons.ToArray()));
+    }
+
+    private static double ComputeSliceLoudnessPhons(ReadOnlySpan<double> residualSlice, int sampleRate)
+    {
+        int n = 1;
+        while (n < residualSlice.Length && n < 2048) n <<= 1;
+        if (n < 64) n = 64;
+        var padded = new double[n];
+        residualSlice[..Math.Min(residualSlice.Length, n)].CopyTo(padded);
+        var (linPeak, _, _, _) = FftEngine.ComputeSingleSidedSpectrum(padded, n, FftWindowType.Hann);
+        int bins = linPeak.Length;
+        var freqs = new double[bins];
+        double df = sampleRate / (2.0 * bins);
+        for (int i = 0; i < bins; i++) freqs[i] = i * df;
+        var ear = ApxRubAndBuzzLoudness.ApplyEarWeighting(linPeak, sampleRate);
+        var bark = ApxRubAndBuzzLoudness.ApplyAuditoryFilterBands(freqs, ear);
+        if (bark.Length == 0) return 0.0;
+        var spread = ApxRubAndBuzzLoudness.ApplyFrequencySpreading(bark);
+        ApxRubAndBuzzLoudness.CalculateLoudness(spread, out _, out double sones);
+        if (!(sones > 0.0) || !double.IsFinite(sones)) return 0.0;
+        // ISO 532B / Zwicker sone-to-phon conversion (1 sone = 40 phon, +10 phon per doubling).
+        return sones >= 1.0 ? 40.0 + 10.0 * Math.Log2(sones) : 40.0 * Math.Pow(sones + 0.0005, 0.35);
     }
 }

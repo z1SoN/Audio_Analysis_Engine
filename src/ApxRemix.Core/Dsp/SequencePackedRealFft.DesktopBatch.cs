@@ -5,19 +5,23 @@ namespace ApxRemix.Core.Dsp;
 internal static partial class SequencePackedRealFft
 {
     // 仅列出有专门桌面分解次序的采集长度；其他点数由上层另外派发。
-    internal static bool SupportsDesktopBatch(int length) => length is 8064 or 11200 or 12000 or 24000;
+    internal static bool SupportsDesktopBatch(int length) =>
+        length is 8064 or 11200 or 12000 or 12288 or 24000 or 32768 or 65536;
 
     // 从 N 个实样本生成含 N/2+1 个复格的单边谱，先用该长度专属的混合基分解。
     internal static Complex[] ForwardDesktopBatch(ReadOnlySpan<double> input)
     {
         int length = input.Length;
-        // 四种长度分别列出从外层到内层的分支数，其余点数留给八点或十六点叶节点。
+        // 列出从外层到内层的分支数，其余点数留给八点或十六点叶节点。
         ReadOnlySpan<int> radices = length switch
         {
             8064 => [7, 4, 3, 3],
             11200 => [7, 4, 5, 5],
             12000 => [5, 3, 5, 5],
+            12288 => [3, 4, 4, 4, 4],
             24000 => [5, 4, 3, 5, 5],
+            32768 => [8, 4, 8, 8],
+            65536 => [8, 8, 8, 8],
             _ => throw new ArgumentOutOfRangeException(nameof(input))
         };
         // 用整段长度的相位网格，邻近两实点打包成一个复样本，先求 N/2 点变换。
@@ -30,7 +34,9 @@ internal static partial class SequencePackedRealFft
         var result = new Complex[half + 1];
         result[0] = new(packed[0].Real + packed[0].Imaginary, 0);
         result[half] = new(packed[0].Real - packed[0].Imaginary, 0);
-        result[quarter] = Complex.Conjugate(packed[quarter]);
+        result[quarter] = BitOperations.IsPow2(length)
+            ? new(packed[quarter].Real, 0.0 - packed[quarter].Imaginary)
+            : Complex.Conjugate(packed[quarter]);
         for (int k = 1; k < quarter; k++)
         {
             // 将 k 与 N/2−k 的复数分量分离，转过一个采样的相角后同时求出这对正频格。
@@ -54,6 +60,8 @@ internal static partial class SequencePackedRealFft
         {
             if (output.Length == 16)
                 ForwardMixedLeaf(input, offset, stride, output);
+            else if (BitOperations.IsPow2(length))
+                ForwardPacked(input, offset, stride, output, [], desktop: true);
             else
                 ForwardBatchLeaf8(input, offset, stride, output);
             return;
@@ -68,14 +76,14 @@ internal static partial class SequencePackedRealFft
 
         // 依据子变换长度换算查表步长，给各路补上起点不同造成的相移。
         int phaseStep = length / output.Length;
-        Span<Complex> values = stackalloc Complex[7];
+        Span<Complex> values = stackalloc Complex[8];
         for (int k = 0; k < width; k++)
         {
             values[0] = output[k];
             for (int part = 1; part < radix; part++)
                 values[part] = output[k + width * part] * BatchRoot(phaseGrid, length, part * phaseStep * k);
 
-            // 按当前路数使用三、四、五或七点蝶形，各输出间隔 width，形成上一层需要的排列。
+            // 各输出间隔 width，形成上一层需要的排列。
             var destination = output[k..];
             switch (radix)
             {
@@ -86,6 +94,7 @@ internal static partial class SequencePackedRealFft
                     break;
                 case 5: BatchRadixFive(values, destination, width); break;
                 case 7: BatchRadixSeven(values, destination, width); break;
+                case 8: RadixEight(values, destination, width, scaleFirst: true); break;
             }
         }
     }
@@ -200,12 +209,18 @@ internal static partial class SequencePackedRealFft
         private static readonly Complex[] Grid8064 = GenerateFirstOctant(8064);
         private static readonly Complex[] Grid11200 = GenerateFirstOctant(11200);
         private static readonly Complex[] Grid24000 = GenerateFirstOctant(24000);
+        private static readonly Lazy<Complex[]> Grid12288 = new(() => GenerateFirstOctant(12288));
+        private static readonly Lazy<Complex[]> Grid32768 = new(() => GenerateFirstOctant(32768));
+        private static readonly Lazy<Complex[]> Grid65536 = new(() => GenerateFirstOctant(65536));
 
-        // 两个专表分别给 8064 和 11200，另两种受支持长度共享 24000 表。
+        // 两种相关长度共享 24000 的相位表；其他长度拥有自己的均匀网格。
         internal static ReadOnlySpan<Complex> Get(int length) => length switch
         {
             8064 => Grid8064,
             11200 => Grid11200,
+            12288 => Grid12288.Value,
+            32768 => Grid32768.Value,
+            65536 => Grid65536.Value,
             _ => Grid24000
         };
 

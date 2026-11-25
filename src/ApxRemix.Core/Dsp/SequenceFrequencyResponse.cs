@@ -160,10 +160,10 @@ public sealed class SequenceFrequencyResponse
     }
 
     // 按主峰到两端的距离分别定渐入、渐出长度；中间平段保持系数 1，右端没空间就跳过。
-    private static double[] CreateImpulseWindow(int used, int peak)
+    internal static double[] CreateImpulseWindow(int used, int peak, double leftFrac = 0.9, double rightFrac = 0.95)
     {
-        int left = (int)Math.Floor(peak * 0.9);
-        int right = (int)Math.Floor((used - peak) * 0.95);
+        int left = Math.Clamp((int)Math.Floor(peak * leftFrac), 0, used);
+        int right = Math.Clamp((int)Math.Floor((used - peak) * rightFrac), 0, used - left);
         var window = new double[used];
         Array.Fill(window, 1, left, used - left - right);
         Taper(left, -Math.PI, 0).CopyTo(window, 0);
@@ -172,7 +172,7 @@ public sealed class SequenceFrequencyResponse
     }
 
     // 按角度采样等波纹门边缘；零点数返回空段，有工作端时直接取其结果。
-    private static double[] Taper(int count, double start, double stop)
+    internal static double[] Taper(int count, double start, double stop)
     {
         if (count == 0) return [];
         var native = SequenceBinEstimator.EquirippleTaper(count,start,stop);

@@ -117,7 +117,12 @@ internal static partial class SequenceBinWorker
                 WriteVector(output, roots, length);
                 break;
             case -5:
-                WriteVector(output, GenerateWindow(length, input.ReadString()), length);
+                var windowType = input.ReadString();
+#if DESKTOP_WORKSHEET
+                if (windowType == "Dolph150" || windowType == "Dolph200" || windowType == "Dolph250")
+                    InitializeDesktopMkl();
+#endif
+                WriteVector(output, GenerateWindow(length, windowType), length);
                 break;
             case -10:
                 GenerateChirp(length, input, output);

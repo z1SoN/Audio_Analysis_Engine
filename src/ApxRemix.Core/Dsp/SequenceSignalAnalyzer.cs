@@ -16,16 +16,29 @@ public sealed class SequenceSignalAnalyzer
     public const int PositiveZeroCrossingKernelLength = 2 * PositiveZeroCrossingPreTrigger - 1;
     private readonly int length, averages, halfWidth;
     private readonly double sampleRate;
-    private readonly bool digital, dcCoupled;
+    private readonly bool digital, dcCoupled, moveToBinCenter;
+    private readonly bool desktopWorksheet;
     private readonly SequenceAverage mode;
     private readonly SequenceFftWindow window;
     private double[]? waveform, power;
     private int waveCount, powerCount;
     private bool waveInvalid, powerInvalid;
+    public double? LastMoveToBinCenterRatio { get; private set; }
 
     // 一个实例固定采样率、偶数帧长及窗。平均次数至少为一，频格间距等于采样率除以帧长。
     public SequenceSignalAnalyzer(int fftLength, double sampleRate, FftWindowType windowType,
         SequenceAverage mode = SequenceAverage.Power, int averages = 1, bool digital = true, bool dcCoupled = true)
+        : this(fftLength, sampleRate, windowType, mode, averages, digital, dcCoupled, SequenceBinEstimator.DesktopWorksheet)
+    {
+    }
+
+    /// <summary>创建实际 Sequence Signal Analyzer 页面使用的桌面工作表。</summary>
+    public static SequenceSignalAnalyzer CreateDesktop(int fftLength, double sampleRate, FftWindowType windowType,
+        SequenceAverage mode = SequenceAverage.Power, int averages = 1)
+        => new(fftLength, sampleRate, windowType, mode, averages, digital: true, dcCoupled: true, desktopWorksheet: true);
+
+    private SequenceSignalAnalyzer(int fftLength, double sampleRate, FftWindowType windowType,
+        SequenceAverage mode, int averages, bool digital, bool dcCoupled, bool desktopWorksheet)
     {
         if (fftLength < 16 || fftLength % 2 != 0) throw new ArgumentOutOfRangeException(nameof(fftLength));
         if (!(sampleRate > 0 && double.IsFinite(sampleRate))) throw new ArgumentOutOfRangeException(nameof(sampleRate));
@@ -37,13 +50,27 @@ public sealed class SequenceSignalAnalyzer
         this.averages = averages;
         this.digital = digital;
         this.dcCoupled = dcCoupled;
-        window = SequenceFftWindow.Get(length, windowType);
+        this.desktopWorksheet = desktopWorksheet;
+        moveToBinCenter = windowType == FftWindowType.NoneMoveToBinCenter;
+        bool previous = SequenceBinEstimator.DesktopWorksheet;
+        SequenceBinEstimator.DesktopWorksheet = desktopWorksheet;
+        try { window = SequenceFftWindow.Get(length, moveToBinCenter ? FftWindowType.Rectangular : windowType); }
+        finally { SequenceBinEstimator.DesktopWorksheet = previous; }
         halfWidth = window.HalfWidth;
     }
 
     // 输入已触发的一块采样和触发位置。频谱固定点数，回传波形与完整采集块等长。
     public SequenceSpectrum Push(ReadOnlySpan<double> samples, double triggerPosition = 0,
         double triggerDelaySeconds = 0, double timeZeroSample = 0)
+    {
+        bool previous = SequenceBinEstimator.DesktopWorksheet;
+        SequenceBinEstimator.DesktopWorksheet = desktopWorksheet;
+        try { return PushCore(samples, triggerPosition, triggerDelaySeconds, timeZeroSample); }
+        finally { SequenceBinEstimator.DesktopWorksheet = previous; }
+    }
+
+    private SequenceSpectrum PushCore(ReadOnlySpan<double> samples, double triggerPosition,
+        double triggerDelaySeconds, double timeZeroSample)
     {
         // 逐点平均要求一组记录形状相同；触发位置用采样点计，延时另以秒计。
         if (samples.IsEmpty || waveform != null && waveform.Length != samples.Length)
@@ -52,10 +79,21 @@ public sealed class SequenceSignalAnalyzer
         // 同步平均把同相位的采样点先相加；普通功率平均在 FFT 后相加，相反相位的两帧依然保留功率。
         Accumulate(ref waveform, ref waveCount, ref waveInvalid, samples, mode == SequenceAverage.Synchronous ? averages : 1, SequenceAverage.Power);
         var data = waveform!;
-        // 起点取整并夹在最后一个能容纳 FFT 段的位置。短记录只复制可用点，末尾补零。
-        int start = (int)Math.Min(Math.Round(triggerPosition), Math.Max(0, data.Length - length));
+        // 起点取整并夹在最后一个能容纳 FFT 段的位置。MoveToBinCenter 模式下先重采样使主频居中再做无窗 FFT。
         var slice = new double[length];
-        data.AsSpan(start, Math.Min(length, data.Length - start)).CopyTo(slice);
+        if (moveToBinCenter && data.Length >= ApxMoveToBinCenter.CalculateMinimumAcqLength(length))
+        {
+            int srcStart = (int)Math.Min(Math.Round(triggerPosition), Math.Max(0, data.Length - ApxMoveToBinCenter.CalculateMinimumAcqLength(length)));
+            var moved = ApxMoveToBinCenter.MoveToBinCenter(data.AsSpan(srcStart), length, sampleRate, out double? ratio);
+            LastMoveToBinCenterRatio = ratio;
+            moved.AsSpan(0, Math.Min(length, moved.Length)).CopyTo(slice);
+        }
+        else
+        {
+            LastMoveToBinCenterRatio = null;
+            int start = (int)Math.Min(Math.Round(triggerPosition), Math.Max(0, data.Length - length));
+            data.AsSpan(start, Math.Min(length, data.Length - start)).CopyTo(slice);
+        }
         // 数字输入乘 √2，使峰值为一的正弦按有效值报告为一；模拟输入保留原尺度。
         double units = digital ? Math.Sqrt(2) : 1;
         for (int i = 0; i < length; i++) slice[i] *= units;

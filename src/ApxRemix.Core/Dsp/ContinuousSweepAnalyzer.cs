@@ -152,6 +152,9 @@ public static class ContinuousSweepAnalyzer
         return GenerateApChirp(t0, t3, f1, f2, f3, sampleRate, config.LevelDbfs, out _);
     }
 
+    internal static double LogChirpEndFrequency(double startHz, double stopHz, int sampleRate) =>
+        Math.Min(sampleRate * 0.5, Math.Max(startHz + 10.0, stopHz) * 1.1);
+
     public static double[] GenerateLogChirp(ContinuousSweepConfig config, int sampleRate)
     {
         double f1 = Math.Clamp(config.StartFrequencyHz, 5.0, sampleRate * 0.40);
@@ -160,20 +163,28 @@ public static class ContinuousSweepAnalyzer
         int n = Math.Max(2048, (int)Math.Round(duration * sampleRate));
 
         double amp = SignalGeneratorDsp.DbfsToLinearPeak(config.LevelDbfs);
-        // 把扫频时间除以端点频率比的自然对数，得到频率增长 e 倍所用的时间。每个倍频程于是占用相同的时长。
-        double lnRatio = Math.Log(f2 / f1);
+        // 对齐 APx500 ChirpParams：载波在 [0, T3] 内从 F1 扫至 F3 = min(1.1·F2, Fs/2)，
+        // 右端余弦平方窗施加在 [Freq2Time(F2), T3]（即有效频带 F2 之上），保持总长度不变且 [F1, F2] 全程满幅。
+        double f3 = LogChirpEndFrequency(f1, f2, sampleRate);
+        double lnRatio = Math.Log(f3 / f1);
         double l = duration / lnRatio;
         double k = 2.0 * Math.PI * f1 * l;
+        double t2 = l * Math.Log(f2 / f1);
+        double rightSpan = duration - t2;
 
         var chirp = new double[n];
-        int fadeSamples = Math.Min(n / 10, (int)(sampleRate * 0.005));
-
+        // 对齐 APx500 ChirpParams / LogChirp：t = 0 处 sin(0) = 0 无左端淡入窗，仅在 [t2, T] (F2..F3) 施加右端余弦平方淡出，
+        // 避免在 [0, 2 ms] 截削起始低频能量导致 20 Hz 幅度误差与虚假谐波失真。
         for (int i = 0; i < n; i++)
         {
             double t = (double)i / sampleRate;
             double env = 1.0;
-            if (i < fadeSamples) env = 0.5 * (1.0 - Math.Cos(Math.PI * i / fadeSamples));
-            else if (i > n - fadeSamples) env = 0.5 * (1.0 - Math.Cos(Math.PI * (n - i) / fadeSamples));
+            if (rightSpan > 0.0 && t > t2)
+            {
+                double u = Math.Clamp((t - t2) / rightSpan, 0.0, 1.0);
+                double rc = 0.5 * (1.0 + Math.Cos(Math.PI * u));
+                env = rc * rc;
+            }
 
             chirp[i] = amp * env * Math.Sin(k * (Math.Exp(t / l) - 1.0));
         }
@@ -284,23 +295,28 @@ public static class ContinuousSweepAnalyzer
 
         int lenX = referenceChirp.Length;
         int lenY = recordedResponse.Length;
-        // 两段记录可能不等长，补零到共同的 FFT 长度后，同一频点的 X 和 Y 才表示同一频率。补零改变谱的取点间距，不会增加已录信号的信息。
-        int minN = Math.Max(lenX, lenY) + Math.Min(lenX, lenY) / 2;
-        int fftSize = NextPowerOfTwo(Math.Max(4096, minN));
+        bool isFastSweep = config.ChirpType == ContinuousChirpType.FastSweep;
+        int before = (int)(0.05 * sampleRate);
+
+        // 对齐 APx500 ChirpParams：连续扫频采用 GoodLengths 帧长（而非 2 的幂过度补零），
+        // 保证线性 IR 门长 linFftLen = FftLength / 2 及频率分辨率与原版一致；Fast Sweep 维持独立离散分析路径。
+        int fftSize = isFastSweep
+            ? NextPowerOfTwo(Math.Max(4096, Math.Max(lenX, lenY) + Math.Min(lenX, lenY) / 2))
+            : SequenceTransform.NextLength(Math.Max(Math.Max(lenX, lenY), 2 * before + 2), allowShort: true);
 
         var xBuf = new Complex[fftSize];
         var yBuf = new Complex[fftSize];
         for (int i = 0; i < lenX; i++) xBuf[i] = new Complex(referenceChirp[i], 0.0);
         for (int i = 0; i < lenY; i++) yBuf[i] = new Complex(recordedResponse[i], 0.0);
 
-        FftEngine.ForwardInPlace(xBuf);
-        FftEngine.ForwardInPlace(yBuf);
+        SequenceTransform.Forward(xBuf);
+        SequenceTransform.Forward(yBuf);
 
         double maxPower = 0.0;
-        double binHz = (double)sampleRate / fftSize;
-        int fStartBin = Math.Clamp((int)Math.Ceiling(Math.Max(20.0, config.StartFrequencyHz) / binHz), 1, fftSize / 2 - 2);
+        double deconvBinHz = (double)sampleRate / fftSize;
+        int fStartBin = Math.Clamp((int)Math.Ceiling(Math.Max(20.0, config.StartFrequencyHz) / deconvBinHz), 1, fftSize / 2 - 2);
         double stopHz = CheckStopFrequency(config.StopFrequencyHz, sampleRate);
-        int fStopBin = Math.Clamp((int)Math.Floor(stopHz / binHz), fStartBin + 1, fftSize / 2 - 1);
+        int fStopBin = Math.Clamp((int)Math.Floor(stopHz / deconvBinHz), fStartBin + 1, fftSize / 2 - 1);
         for (int i = fStartBin; i <= fStopBin; i++)
         {
             double p = xBuf[i].Real * xBuf[i].Real + xBuf[i].Imaginary * xBuf[i].Imaginary;
@@ -320,150 +336,345 @@ public static class ContinuousSweepAnalyzer
             double p = xBuf[b].Real * xBuf[b].Real + xBuf[b].Imaginary * xBuf[b].Imaginary;
             if (p >= bandFloor) excitedBins++;
         }
-        if (config.ChirpType != ContinuousChirpType.FastSweep && checkedBins > 8 && (double)excitedBins / checkedBins < 0.25)
+        if (!isFastSweep && checkedBins > 8 && (double)excitedBins / checkedBins < 0.25)
             throw new InvalidOperationException($"参考文件不是有效的宽带扫频激励（目标频带仅 {excitedBins * 100.0 / checkedBins:F0}% 受激，可能选错了参考文件）。");
 
-        // 线性通路有 Y=HX，故 H 可由 Y·conj(X)/(|X|²+ε) 估计。ε 抑制参考很弱处的放大，也会影响那里的幅值。
-        double eps = Math.Max(maxPower * 1e-7, 1e-18);
+        double minimumReferenceMagnitude = Math.Sqrt(maxPower) * 1e-6;
+        int half = fftSize / 2;
 
-        var hSpec = new Complex[fftSize];
-        for (int i = 0; i < fftSize; i++)
+        if (isFastSweep)
         {
-            double denom = xBuf[i].Real * xBuf[i].Real + xBuf[i].Imaginary * xBuf[i].Imaginary + eps;
-            hSpec[i] = (yBuf[i] * Complex.Conjugate(xBuf[i])) / denom;
+            var hSpec = new Complex[fftSize];
+            double eps = Math.Max(maxPower * 1e-7, 1e-18);
+            for (int i = 0; i < fftSize; i++)
+            {
+                double denom = xBuf[i].Real * xBuf[i].Real + xBuf[i].Imaginary * xBuf[i].Imaginary + eps;
+                hSpec[i] = yBuf[i] * (Complex.Conjugate(xBuf[i]) / denom);
+            }
+            var irComplex = (Complex[])hSpec.Clone();
+            SequenceTransform.Inverse(irComplex);
+            var fullIrFast = new double[fftSize];
+            int rawPeakFast = 0;
+            double peakAbsFast = 0.0, irSumSqFast = 0.0;
+            for (int i = 0; i < fftSize; i++)
+            {
+                double val = irComplex[i].Real;
+                fullIrFast[i] = val;
+                irSumSqFast += val * val;
+                if (Math.Abs(val) > peakAbsFast) { peakAbsFast = Math.Abs(val); rawPeakFast = i; }
+            }
+            double irRmsFast = Math.Sqrt(irSumSqFast / fftSize);
+            double irCrestFast = irRmsFast > 1e-18 ? peakAbsFast / irRmsFast : 0.0;
+            if (peakAbsFast <= 1e-6 || irCrestFast < 6.0)
+                throw new InvalidOperationException($"参考激励与实测响应未形成有效相关脉冲峰（IR 峰均比 {irCrestFast:F2} < 6.0，可能文件不配对、严重失步或仅为无关噪声）。");
+
+            int signedPeakFast = rawPeakFast <= half ? rawPeakFast : rawPeakFast - fftSize;
+            double delayMsFast = signedPeakFast * 1000.0 / sampleRate;
+            int tailFast = (int)(sampleRate * Math.Clamp(config.ResponseTailMs / 1000.0, 0.1, 3.0));
+            int firstFast = Math.Max(-half, Math.Min(0, signedPeakFast) - (int)Math.Ceiling(sampleRate * 0.010));
+            int lastFast = Math.Min(half - 1, Math.Max(0, signedPeakFast) + tailFast);
+            int lenFast = lastFast - firstFast + 1;
+            var irDispFast = new double[lenFast];
+            var irTimeFast = new double[lenFast];
+            for (int i = 0; i < lenFast; i++)
+            {
+                int sample = firstFast + i;
+                irDispFast[i] = fullIrFast[(sample + fftSize) % fftSize];
+                irTimeFast[i] = sample * 1000.0 / sampleRate;
+            }
+            double calFast = AudioMetricsAnalyzer.ComputeCalibrationGainOffsetDb(
+                config.InputFullScaleVoltageVrms, config.OutputFullScaleVoltageVrms);
+            var fastPoints = ExtractResponsePointsFromSpectrum(
+                hSpec, sampleRate, config.StartFrequencyHz, stopHz,
+                config.OutputPoints == 0 ? 1200 : config.OutputPoints, refActiveLevelDbfs, gainOffsetDb: calFast,
+                phaseMode: config.PhaseMode, delaySamples: signedPeakFast,
+                measuredMagnitude: bin => xBuf[bin].Magnitude >= minimumReferenceMagnitude ? yBuf[bin].Magnitude / xBuf[bin].Magnitude : double.NaN);
+            return BenchFastSweep.Analyze(recordedResponse, referenceChirp, sampleRate, config, signedPeakFast,
+                new(fastPoints, irDispFast, irTimeFast, delayMsFast, signedPeakFast, peakAbsFast, sampleRate,
+                    wasClipping, sourceDescription, EnergyTimeCurveDb: ComputeEnergyTimeCurveDb(irDispFast),
+                    Acquired: recordedResponse.ToArray(), Reference: referenceChirp.ToArray()));
         }
 
-        // 把 H 变回时间域以寻找脉冲响应主峰。利用共轭和正向 FFT 实现逆变换，因此要补 1/N 的幅值比例。
-        var irComplex = new Complex[fftSize];
-        for (int i = 0; i < fftSize; i++) irComplex[i] = Complex.Conjugate(hSpec[i]);
-        FftEngine.ForwardInPlace(irComplex);
+        // 对齐 APx500 ChirpParams ctor (L28295-28347)：
+        // 通带 [F1, F2] 内取精确逆 1/X(k)，通带外按 100×|1/X(F1)| 与 1.1×|1/X(F2)| 限幅，直流格置零，
+        // 并乘以 (-1)^k 将时间零点居中于 fullIr[FftLength / 2]。
+        int lowRefBin = Math.Clamp((int)Math.Round(config.StartFrequencyHz / sampleRate * fftSize, MidpointRounding.AwayFromZero), 1, half - 2);
+        int highRefBin = Math.Clamp((int)Math.Round(stopHz / sampleRate * fftSize, MidpointRounding.AwayFromZero), lowRefBin + 1, half - 1);
+        double lowMag = Math.Max(xBuf[lowRefBin].Magnitude, minimumReferenceMagnitude);
+        double highMag = Math.Max(xBuf[highRefBin].Magnitude, minimumReferenceMagnitude);
+        double lowInvLimit = 100.0 / lowMag;
+        double highInvLimit = 1.1 / highMag;
 
-        var fullIr = new double[fftSize];
-        double invN = 1.0 / fftSize;
-        int rawPeakIdx = 0;
-        double peakAbs = 0.0;
+        var hCenteredSpec = new Complex[fftSize];
+        hCenteredSpec[0] = Complex.Zero;
+        for (int k = 1; k <= half; k++)
+        {
+            double mag = xBuf[k].Magnitude;
+            Complex inv;
+            if (mag >= minimumReferenceMagnitude)
+            {
+                inv = Complex.One / xBuf[k];
+                double invMag = 1.0 / mag;
+                if (k <= lowRefBin && invMag > lowInvLimit) inv *= lowInvLimit / invMag;
+                else if (k > highRefBin && invMag > highInvLimit) inv *= highInvLimit / invMag;
+            }
+            else
+            {
+                inv = Complex.Zero;
+            }
+            if ((k & 1) != 0) inv = -inv;
+            hCenteredSpec[k] = yBuf[k] * inv;
+            if (k < half)
+                hCenteredSpec[fftSize - k] = Complex.Conjugate(hCenteredSpec[k]);
+        }
+
+        // 反卷积回到时域（t = 0 位于 half = fftSize / 2）
+        SequenceTransform.Inverse(hCenteredSpec);
+        var centeredIr = new double[fftSize];
         double irSumSq = 0.0;
-        int causalLimit = fftSize / 2;
-
+        int globalPeakIdx = half;
+        double globalPeakAbs = 0.0;
         for (int i = 0; i < fftSize; i++)
         {
-            double val = irComplex[i].Real * invN;
-            fullIr[i] = val;
+            double val = hCenteredSpec[i].Real;
+            centeredIr[i] = val;
             irSumSq += val * val;
-            if (Math.Abs(val) > peakAbs)
-            {
-                peakAbs = Math.Abs(val);
-                rawPeakIdx = i;
-            }
+            double abs = Math.Abs(val);
+            if (abs > globalPeakAbs) { globalPeakAbs = abs; globalPeakIdx = i; }
+        }
+
+        // 对齐 APx500 FullAnalysis (L28816-28837)：优先在 [half - before, fftSize - 1] 内搜索主峰；
+        // 若开环录音存在超过 50 ms 的负时延导致主峰落在该区间之前，再回退到全局主峰。
+        int causalSearchStart = Math.Max(0, half - before);
+        int peakInFullIr = causalSearchStart;
+        double peakAbs = 0.0;
+        for (int i = causalSearchStart; i < fftSize; i++)
+        {
+            double abs = Math.Abs(centeredIr[i]);
+            if (abs > peakAbs) { peakAbs = abs; peakInFullIr = i; }
+        }
+        if (globalPeakAbs > peakAbs * 2.0)
+        {
+            peakAbs = globalPeakAbs;
+            peakInFullIr = globalPeakIdx;
         }
 
         // 5. 校验反卷积脉冲响应相关性（拦截互不相关的噪声或错配的参考/响应文件）
-        // 只有主峰相对整段 RMS 足够突出时才把它当作时延线索。FFT 的后半段按负序号解释，样本差除以 Fs 就是秒。
         double irRms = Math.Sqrt(irSumSq / fftSize);
         double irCrest = irRms > 1e-18 ? peakAbs / irRms : 0.0;
         if (peakAbs <= 1e-6 || irCrest < 6.0)
             throw new InvalidOperationException($"参考激励与实测响应未形成有效相关脉冲峰（IR 峰均比 {irCrest:F2} < 6.0，可能文件不配对、严重失步或仅为无关噪声）。");
 
-        int signedPeakIdx = rawPeakIdx <= causalLimit ? rawPeakIdx : rawPeakIdx - fftSize;
-        double delayMs = signedPeakIdx * 1000.0 / sampleRate;
+        int signedPeakIdx = peakInFullIr - half;
+        double fractionalPeakIdx = ChirpResultMath.PeakInterp(centeredIr, peakInFullIr);
+        double delayMs = (fractionalPeakIdx - half) * 1000.0 / sampleRate;
 
-        // Keep the pre-trigger response so that a window around a zero-delay peak
-        // includes both sides of the impulse. Circular IFFT samples before zero live at the end.
-        // 保留主峰前的一小段以及配置的尾响；把环形下标转换成以零时刻为基准的毫秒，图上就能看到延迟的正负。
-        int tailSamples = (int)(sampleRate * Math.Clamp(config.ResponseTailMs / 1000.0, 0.1, 3.0));
-        int firstSample = Math.Max(-causalLimit, Math.Min(0, signedPeakIdx) - (int)Math.Ceiling(sampleRate * 0.010));
-        int lastSample = Math.Min(causalLimit - 1, Math.Max(0, signedPeakIdx) + tailSamples);
+        // 高速错开串扰模式：对齐 APx500 OPPE837xSG，从居中 IR 原位切除 2 ms 串扰脉冲，
+        // 不再截断直通通道的线性窗长（避免 Ch1 低频响应、相位与群延迟劣化）。
+        double[]? excisedXtalkSlice = null;
+        if (leakageOffsetSamples != 0)
+            excisedXtalkSlice = ChirpCrosstalk.ExciseStaggeredImpulse(centeredIr, peakInFullIr, leakageOffsetSamples, sampleRate, stopHz);
+
+        // 对齐 APx500 linImpResp：保留主峰/零点前 50 ms 至因果半轴末端，时间轴以零时刻为基准（毫秒）
+        int firstSample = Math.Max(-half, Math.Min(0, signedPeakIdx) - before);
+        int lastSample = half - 1;
         int length = lastSample - firstSample + 1;
         var irDisplay = new double[length];
         var irTimeMs = new double[length];
         for (int i = 0; i < length; i++)
         {
             int sample = firstSample + i;
-            irDisplay[i] = fullIr[(sample + fftSize) % fftSize];
+            irDisplay[i] = centeredIr[half + sample];
             irTimeMs[i] = sample * 1000.0 / sampleRate;
         }
 
         double calGainOffsetDb = AudioMetricsAnalyzer.ComputeCalibrationGainOffsetDb(
             config.InputFullScaleVoltageVrms, config.OutputFullScaleVoltageVrms);
 
-        // The impulse inversion needs out-of-band regularization. The measured gain
-        // uses Y/X at excited bins; its magnitude must not include that regularizer.
-        // 脉冲反卷积要抑制弱激励处的除零；报告频响幅值在有足够激励的格上直接取 |Y|/|X|，否则标 NaN。
-        double minimumReferenceMagnitude = Math.Sqrt(maxPower) * 1e-6;
-        double MeasuredMagnitude(int bin) => xBuf[bin].Magnitude >= minimumReferenceMagnitude
-            ? yBuf[bin].Magnitude / xBuf[bin].Magnitude : double.NaN;
-        var points = ExtractResponsePointsFromSpectrum(
-            hSpec, sampleRate, config.StartFrequencyHz, stopHz,
-            config.OutputPoints == 0 ? 1200 : config.OutputPoints, refActiveLevelDbfs, gainOffsetDb: calGainOffsetDb,
-            phaseMode: config.PhaseMode, delaySamples: signedPeakIdx, measuredMagnitude: MeasuredMagnitude);
-
-        SweepSpectrum? measuredSpectrum = null;
-        // 激励包络可能随频率改变。把每个频点的激励电平加回数字增益，才能估计该点的响应电平。
-        if (config.ChirpType != ContinuousChirpType.FastSweep)
+        // 对齐 APx500 LinearResponseResults + FftWithAsymWin.KvSOGjdaHk：
+        // LogChirp 严格采用原版加窗脉冲频谱（不做 refGatedBuf 除法，避免 20–50 Hz +0.097 dB 边缘畸变）；
+        // 仅保留给旧版非界面 ApChirp 的带限参考窗归一以维持历史单测口径。
+        bool normalizeLegacyApChirp = config.ChirpType == ContinuousChirpType.ApChirp;
+        double[]? centeredRefIr = null;
+        if (normalizeLegacyApChirp)
         {
-            var envelope = SweepReferenceLevels.Measure(referenceChirp,sampleRate,config.StartFrequencyHz,config.StopFrequencyHz);
-            // 优先用采集到的参考逐频电平，单值回退取整段有效区 RMS。两者都是激励在数字满量程上的读数。
-            double ExcitationLevel(double hz) => envelope == null ? refActiveLevelDbfs : FrequencyGainTable.GainAtHz(envelope,hz);
-            double referenceHz = Math.Clamp(1000, config.StartFrequencyHz, stopHz);
-            double referenceLevel = SpectrumGain(referenceHz,binHz,fftSize,MeasuredMagnitude,0) + ExcitationLevel(referenceHz);
-            if (config.OutputPoints == 0)
+            var refCenteredSpec = new Complex[fftSize];
+            refCenteredSpec[0] = Complex.Zero;
+            for (int k = 1; k <= half; k++)
             {
-                Func<int,double> magnitudeAt = MeasuredMagnitude;
-                var hz = SpectrumFrequencies(config.StartFrequencyHz, stopHz, binHz);
-                var gains = new double[hz.Length];
-                var levels = new double[hz.Length];
-                var relative = new double[hz.Length];
-                var phase = ExtractChirpPhases(hSpec,hz,binHz,signedPeakIdx,config.PhaseMode);
-                for (int i=0;i<hz.Length;i++)
+                double mag = xBuf[k].Magnitude;
+                Complex inv = mag >= minimumReferenceMagnitude ? Complex.One / xBuf[k] : Complex.Zero;
+                if (mag >= minimumReferenceMagnitude)
                 {
-                    double g=SpectrumGain(hz[i],binHz,fftSize,magnitudeAt,calGainOffsetDb);
-                    gains[i]=g;
-                    levels[i]=g-calGainOffsetDb+ExcitationLevel(hz[i]);
-                    relative[i]=levels[i]-referenceLevel;
-                    if (!double.IsFinite(g)) phase[i]=double.NaN;
+                    double invMag = 1.0 / mag;
+                    if (k <= lowRefBin && invMag > lowInvLimit) inv *= lowInvLimit / invMag;
+                    else if (k > highRefBin && invMag > highInvLimit) inv *= highInvLimit / invMag;
                 }
-                measuredSpectrum=new(hz,gains,levels,relative,phase);
+                if ((k & 1) != 0) inv = -inv;
+                refCenteredSpec[k] = xBuf[k] * inv;
+                if (k < half) refCenteredSpec[fftSize - k] = Complex.Conjugate(refCenteredSpec[k]);
             }
-            for (int i = 0; i < points.Count; i++)
+            SequenceTransform.Inverse(refCenteredSpec);
+            centeredRefIr = new double[fftSize];
+            for (int i = 0; i < fftSize; i++) centeredRefIr[i] = refCenteredSpec[i].Real;
+        }
+
+        int linStart = peakInFullIr >= causalSearchStart ? causalSearchStart : Math.Max(0, peakInFullIr - before);
+        int available = fftSize - linStart;
+        int peakInLin = peakInFullIr - linStart;
+        int linFftLen = 2 * (half / 2);
+        int sliceStart = Math.Clamp(peakInLin - linFftLen / 2, 0, Math.Max(0, available - linFftLen));
+        int used = Math.Min(available, linFftLen);
+        int peakInSlice = peakInLin - sliceStart;
+        var asymWin = SequenceFrequencyResponse.CreateImpulseWindow(used, peakInSlice, 0.90, 0.95);
+
+        bool needGd = !config.OpenLoop && computeGroupDelay;
+        var gatedBuf = new Complex[linFftLen];
+        Complex[]? refGatedBuf = normalizeLegacyApChirp ? new Complex[linFftLen] : null;
+        Complex[]? gatedMomentBuf = needGd ? new Complex[linFftLen] : null;
+        Complex[]? refMomentBuf = needGd && normalizeLegacyApChirp ? new Complex[linFftLen] : null;
+        for (int i = 0; i < used; i++)
+        {
+            double w = asymWin[i];
+            int rel = i - peakInSlice;
+            double ySample = centeredIr[linStart + sliceStart + i] * w;
+            gatedBuf[i] = new Complex(ySample, 0.0);
+            if (needGd)
+                gatedMomentBuf![i] = new Complex(ySample * rel, 0.0);
+            if (normalizeLegacyApChirp)
             {
-                var p = points[i];
-                double excitation = ExcitationLevel(p.FrequencyHz);
-                double level = p.Ch1GainDb-calGainOffsetDb+excitation;
-                points[i] = p with { ExcitationToneDbfs=excitation,Ch1LevelDbfs=level,Ch2LevelDbfs=level,
-                    Ch1RelativeDb=level-referenceLevel,Ch2RelativeDb=level-referenceLevel };
+                int refSrc = half + rel;
+                double rSample = (uint)refSrc < (uint)fftSize ? centeredRefIr![refSrc] * w : 0.0;
+                refGatedBuf![i] = new Complex(rSample, 0.0);
+                if (needGd) refMomentBuf![i] = new Complex(rSample * rel, 0.0);
             }
         }
+        SequenceTransform.Forward(gatedBuf);
+        if (refGatedBuf is not null) SequenceTransform.Forward(refGatedBuf);
+        if (needGd)
+        {
+            SequenceTransform.Forward(gatedMomentBuf!);
+            if (refMomentBuf is not null) SequenceTransform.Forward(refMomentBuf);
+        }
+
+        var linearSpec = new Complex[linFftLen];
+        double linBinHz = (double)sampleRate / linFftLen;
+        int linHalf = linFftLen / 2;
+        double peakPhaseStep = Math.Tau * peakInSlice / linFftLen;
+        for (int k = 0; k <= linHalf; k++)
+        {
+            int xBin = Math.Clamp((int)Math.Round(k * linBinHz / deconvBinHz), 0, half);
+            Complex val;
+            if (xBuf[xBin].Magnitude < minimumReferenceMagnitude)
+                val = new Complex(double.NaN, double.NaN);
+            else if (refGatedBuf is not null)
+                val = refGatedBuf[k].Magnitude >= 1e-6 ? gatedBuf[k] / refGatedBuf[k] : new Complex(double.NaN, double.NaN);
+            else
+                val = gatedBuf[k] * Complex.FromPolarCoordinates(1.0, k * peakPhaseStep);
+            linearSpec[k] = val;
+            if (k > 0 && k < linHalf) linearSpec[linFftLen - k] = Complex.Conjugate(val);
+        }
+
+        double MeasuredMagnitude(int bin) => linearSpec[bin].Magnitude;
+        var points = ExtractResponsePointsFromSpectrum(
+            linearSpec, sampleRate, config.StartFrequencyHz, stopHz,
+            config.OutputPoints == 0 ? 1200 : config.OutputPoints, refActiveLevelDbfs, gainOffsetDb: calGainOffsetDb,
+            phaseMode: config.PhaseMode, delaySamples: signedPeakIdx, measuredMagnitude: MeasuredMagnitude,
+            alreadyPeakAligned: true);
+
+        // 激励包络可能随频率改变。把每个频点的激励电平加回数字增益，才能估计该点的响应电平。
+        var envelope = SweepReferenceLevels.Measure(referenceChirp, sampleRate, config.StartFrequencyHz, config.StopFrequencyHz);
+        double ExcitationLevel(double hz) => envelope == null ? refActiveLevelDbfs : FrequencyGainTable.GainAtHz(envelope, hz);
+        double referenceHz = Math.Clamp(1000, config.StartFrequencyHz, stopHz);
+        double referenceLevel = SpectrumGain(referenceHz, linBinHz, linFftLen, MeasuredMagnitude, 0) + ExcitationLevel(referenceHz);
+
+        SweepSpectrum? measuredSpectrum = null;
+        if (config.OutputPoints == 0)
+        {
+            Func<int, double> magnitudeAt = MeasuredMagnitude;
+            var hz = SpectrumFrequencies(config.StartFrequencyHz, stopHz, linBinHz);
+            var gains = new double[hz.Length];
+            var levels = new double[hz.Length];
+            var relative = new double[hz.Length];
+            var phase = ExtractChirpPhases(linearSpec, hz, linBinHz, signedPeakIdx, config.PhaseMode, alreadyPeakAligned: true);
+            for (int i = 0; i < hz.Length; i++)
+            {
+                double g = SpectrumGain(hz[i], linBinHz, linFftLen, magnitudeAt, calGainOffsetDb);
+                gains[i] = g;
+                levels[i] = g - calGainOffsetDb + ExcitationLevel(hz[i]);
+                relative[i] = levels[i] - referenceLevel;
+                if (!double.IsFinite(g)) phase[i] = double.NaN;
+            }
+            measuredSpectrum = new(hz, gains, levels, relative, phase);
+        }
+        for (int i = 0; i < points.Count; i++)
+        {
+            var p = points[i];
+            double excitation = ExcitationLevel(p.FrequencyHz);
+            double level = p.Ch1GainDb - calGainOffsetDb + excitation;
+            points[i] = p with
+            {
+                ExcitationToneDbfs = excitation,
+                Ch1LevelDbfs = level,
+                Ch2LevelDbfs = level,
+                Ch1RelativeDb = level - referenceLevel,
+                Ch2RelativeDb = level - referenceLevel
+            };
+        }
+
         double[] etcDb = ComputeEnergyTimeCurveDb(irDisplay);
 
         IReadOnlyList<FrequencyResponsePoint>? h2Points = null;
         IReadOnlyList<FrequencyResponsePoint>? h3Points = null;
         IReadOnlyList<FrequencyResponsePoint>? thdPoints = null;
-        // 离散 Fast Sweep 交给逐音分析；连续扫频还能利用非线性产物在脉冲响应中的时间偏移来估计谐波。
-        if (config.ChirpType == ContinuousChirpType.FastSweep)
-            return BenchFastSweep.Analyze(recordedResponse, referenceChirp, sampleRate, config, signedPeakIdx,
-                new(points, irDisplay, irTimeMs, delayMs, signedPeakIdx, peakAbs, sampleRate,
-                    wasClipping, sourceDescription, EnergyTimeCurveDb: etcDb, Acquired: recordedResponse.ToArray(), Reference: referenceChirp.ToArray()));
+        Dictionary<int, BenchTrace>? productLevels = null;
         if (config.ExtractHarmonics)
         {
-            (h2Points, h3Points, thdPoints) = ExtractChirpHarmonics(
-                fullIr, hSpec, rawPeakIdx, fftSize, sampleRate, config, refActiveLevelDbfs, points);
+            var harm = ChirpResultMath.ExtractContinuousHarmonics(
+                centeredIr, peakInFullIr, lenY, linearSpec, linFftLen, sampleRate, config, points, ExcitationLevel, useIecRatio: true);
+            h2Points = harm.H2;
+            h3Points = harm.H3;
+            thdPoints = harm.Thd;
+            productLevels = harm.ProductLevels.Count > 0 ? harm.ProductLevels : null;
         }
 
         BenchTrace? crosstalk = null;
         if (leakageOffsetSamples != 0)
         {
-            // 两路激励错开发出的样本数已知时，取直通峰和泄漏峰各自的窗来估计串扰，频率轴从 1 kHz 起取点。
-            var frequencies = points.Where(point => point.FrequencyHz >= 1000).Select(point => point.FrequencyHz).ToArray();
-            crosstalk = ChirpCrosstalk.FromStaggeredImpulse(fullIr, rawPeakIdx, leakageOffsetSamples, frequencies, sampleRate);
+            int harmFftLen = SequenceTransform.NextLength(Math.Max(lenY >> 3, 1024), allowShort: true);
+            crosstalk = excisedXtalkSlice != null
+                ? ChirpCrosstalk.FromExcisedImpulse(excisedXtalkSlice, linearSpec, linFftLen, harmFftLen, sampleRate, config.StartFrequencyHz, stopHz)
+                : ChirpCrosstalk.FromStaggeredImpulse(centeredIr, peakInFullIr, leakageOffsetSamples,
+                    points.Where(point => point.FrequencyHz >= 1000).Select(point => point.FrequencyHz).ToArray(), sampleRate);
         }
+
+        BenchTrace? groupDelay = null;
+        if (needGd && gatedMomentBuf is not null)
+        {
+            var gdFreqs = config.OutputPoints == 0 ? SpectrumFrequencies(config.StartFrequencyHz, stopHz, linBinHz)
+                : points.Select(p => p.FrequencyHz).ToArray();
+            var gdMs = new double[gdFreqs.Length];
+            double msPerSample = 1000.0 / sampleRate;
+            for (int i = 0; i < gdFreqs.Length; i++)
+            {
+                int bin = (int)Math.Round(gdFreqs[i] * linFftLen / sampleRate);
+                if (bin is > 0 && bin < linHalf && gatedBuf[bin].Magnitude > 1e-8 && (refGatedBuf is null || refGatedBuf[bin].Magnitude > 1e-6))
+                {
+                    double yMoment = (gatedMomentBuf[bin] / gatedBuf[bin]).Real;
+                    double rMoment = refMomentBuf is not null && refGatedBuf is not null ? (refMomentBuf[bin] / refGatedBuf[bin]).Real : 0.0;
+                    gdMs[i] = (signedPeakIdx + yMoment - rMoment) * msPerSample;
+                }
+                else gdMs[i] = double.NaN;
+            }
+            groupDelay = new(gdFreqs, gdMs);
+        }
+
         return new ContinuousSweepResult(
             points, irDisplay, irTimeMs, delayMs, signedPeakIdx, peakAbs, sampleRate,
             wasClipping, sourceDescription, h2Points, h3Points, thdPoints, etcDb, Acquired: recordedResponse.ToArray(), Reference: referenceChirp.ToArray(),
             CrosstalkMode: crosstalk == null ? ChirpCrosstalkMode.None : ChirpCrosstalkMode.HighSpeed, Crosstalk: crosstalk,
-            ProductLevels: config.ExtractHarmonics ? ChirpResultMath.LogProducts(fullIr, rawPeakIdx, sampleRate, config, points) : null,
-            GroupDelay: config.OpenLoop || !computeGroupDelay ? null : ChirpResultMath.GroupDelay(irDisplay, irTimeMs[0], sampleRate,
-                config.OutputPoints == 0 ? SpectrumFrequencies(config.StartFrequencyHz,stopHz,(double)sampleRate/NextPowerOfTwo(Math.Max(4096,length*2)))
-                    : points.Select(p => p.FrequencyHz).ToArray()),
+            ProductLevels: productLevels,
+            GroupDelay: groupDelay,
             MeasuredSpectrum: measuredSpectrum);
     }
 
@@ -493,116 +704,6 @@ public static class ContinuousSweepAnalyzer
         for (int i = 0; i < ir.Length; i++)
             db[i] = 20.0 * Math.Log10(Math.Max(env[i] / maxEnv, 1e-6));
         return db;
-    }
-
-    /// <summary>
-    /// Farina 指数扫频谐波分离（对齐 APx500 FullAnalysisResults.HarmResps）：
-    /// 利用对数 Chirp 第 k 次谐波在反卷积脉冲响应中精确提前 Δt_k = (T / ln(f2/f1)) · ln(k) 到达的物理特性，
-    /// 分别在负时延区加窗截取 H2/H3 脉冲响应，变换回频域并与基波频响求比，得到 H2(f)、H3(f) 与 Chirp THD(f)。
-    /// </summary>
-    private static (IReadOnlyList<FrequencyResponsePoint>? H2, IReadOnlyList<FrequencyResponsePoint>? H3, IReadOnlyList<FrequencyResponsePoint>? Thd)
-        ExtractChirpHarmonics(
-            double[] fullIr,
-            Complex[] linearHSpec,
-            int rawPeakIdx,
-            int fftSize,
-            int sampleRate,
-            ContinuousSweepConfig config,
-            double refLevelDbfs,
-            List<FrequencyResponsePoint> linearPoints)
-    {
-        double f1 = Math.Clamp(config.StartFrequencyHz, 5.0, sampleRate * 0.40);
-        double f2 = Math.Max(f1 + 10.0, CheckStopFrequency(config.StopFrequencyHz, sampleRate));
-        double fEnd = config.ChirpType == ContinuousChirpType.ApChirp ? Math.Min(sampleRate * 0.49, f2 * 1.05) : f2;
-        if (fEnd / f1 < 2.8 || config.DurationSeconds < 0.25)
-            return (null, null, null);
-
-        // 对指数扫频，频率增为 m 倍对应固定时间差 L·ln(m)。二、三次谐波反卷积后因而出现在主峰之前相应的采样位置。
-        double lSec = config.DurationSeconds / Math.Log(fEnd / f1);
-        int dt2 = (int)Math.Round(lSec * Math.Log(2.0) * sampleRate);
-        int dt3 = (int)Math.Round(lSec * Math.Log(3.0) * sampleRate);
-        int gap23 = dt3 - dt2;
-        // 若各阶预计峰位太近或已接近循环记录边界，无法可靠分窗，返回缺失曲线。
-        if (dt2 < 128 || gap23 < 64 || dt3 > fftSize / 2 - 128)
-            return (null, null, null);
-
-        Complex[] ExtractOrderSpectrum(int negativeOffset, int halfWin)
-        {
-            int winLen = Math.Max(64, Math.Min(halfWin * 2, fftSize / 4));
-            int hFft = NextPowerOfTwo(Math.Max(4096, winLen * 2));
-            var buf = new Complex[hFft];
-            // 以该阶次预测的峰位为中心截窗，两端平滑以减小截断泄漏。窗口也不能宽到把相邻阶次一起纳入。
-            int center = ((rawPeakIdx - negativeOffset) % fftSize + fftSize) % fftSize;
-            int startOffset = -halfWin;
-            int taper = Math.Max(4, halfWin / 5);
-
-            for (int i = 0; i < winLen; i++)
-            {
-                int src = ((center + startOffset + i) % fftSize + fftSize) % fftSize;
-                double w = 1.0;
-                if (i < taper) w = 0.5 * (1.0 - Math.Cos(Math.PI * i / taper));
-                else if (i >= winLen - taper) w = 0.5 * (1.0 - Math.Cos(Math.PI * (winLen - 1 - i) / taper));
-                buf[i] = new Complex(fullIr[src] * w, 0.0);
-            }
-            FftEngine.ForwardInPlace(buf);
-            return buf;
-        }
-
-        int halfWin2 = Math.Min(dt2 / 3, Math.Min(gap23 / 2 - 8, (int)(sampleRate * 0.015)));
-        int halfWin3 = Math.Min(gap23 / 2 - 8, (int)(sampleRate * 0.010));
-        if (halfWin2 < 24 || halfWin3 < 16)
-            return (null, null, null);
-
-        var h2Spec = ExtractOrderSpectrum(dt2, halfWin2);
-        var h3Spec = ExtractOrderSpectrum(dt3, halfWin3);
-        double linBinHz = (double)sampleRate / linearHSpec.Length;
-        double h2BinHz = (double)sampleRate / h2Spec.Length;
-        double h3BinHz = (double)sampleRate / h3Spec.Length;
-
-        var h2List = new List<FrequencyResponsePoint>(linearPoints.Count);
-        var h3List = new List<FrequencyResponsePoint>(linearPoints.Count);
-        var thdList = new List<FrequencyResponsePoint>(linearPoints.Count);
-
-        foreach (var lp in linearPoints)
-        {
-            double f = lp.FrequencyHz;
-            int linBin = Math.Clamp((int)Math.Round(f / linBinHz), 1, linearHSpec.Length / 2 - 1);
-            double fundMag = Math.Max(linearHSpec[linBin].Magnitude, 1e-9);
-
-            // 若 3f 已超出扫频或采样的有效上界，三次谐波在这个点不可报告。二、三次各自检查，防止把越界读数混入失真。
-            bool h2Valid = 2.0 * f <= f2 * 0.95 && 2.0 * f < sampleRate * 0.47;
-            bool h3Valid = 3.0 * f <= f2 * 0.95 && 3.0 * f < sampleRate * 0.47;
-
-            double r2 = 0.0;
-            double h2Db = double.NaN;
-            if (h2Valid)
-            {
-                int b2 = Math.Clamp((int)Math.Round(2.0 * f / h2BinHz), 1, h2Spec.Length / 2 - 1);
-                r2 = h2Spec[b2].Magnitude / fundMag;
-                h2Db = 20.0 * Math.Log10(Math.Max(r2, 1e-7));
-            }
-
-            double r3 = 0.0;
-            double h3Db = double.NaN;
-            if (h3Valid)
-            {
-                int b3 = Math.Clamp((int)Math.Round(3.0 * f / h3BinHz), 1, h3Spec.Length / 2 - 1);
-                r3 = h3Spec[b3].Magnitude / fundMag;
-                h3Db = 20.0 * Math.Log10(Math.Max(r3, 1e-7));
-            }
-
-            // 幅值比先平方相加再开根号，对应不同谐波功率相加；这里的总量只包括当前可用的二、三次分量。
-            bool thdValid = h2Valid;
-            double thdRatio = Math.Sqrt(r2 * r2 + r3 * r3);
-            double thdDb = thdValid ? 20.0 * Math.Log10(Math.Max(thdRatio, 1e-7)) : double.NaN;
-            double thdPct = thdValid ? thdRatio * 100.0 : double.NaN;
-
-            h2List.Add(new FrequencyResponsePoint(f, h2Db + lp.Ch1LevelDbfs, h2Db + lp.Ch1LevelDbfs, h2Db, h2Db, h2Db, h2Db, null, null, null, XValue: f, IsValid: h2Valid));
-            h3List.Add(new FrequencyResponsePoint(f, h3Db + lp.Ch1LevelDbfs, h3Db + lp.Ch1LevelDbfs, h3Db, h3Db, h3Db, h3Db, null, null, null, XValue: f, IsValid: h3Valid));
-            thdList.Add(new FrequencyResponsePoint(f, thdDb + lp.Ch1LevelDbfs, thdDb + lp.Ch1LevelDbfs, thdDb, thdDb, thdDb, thdDb, null, null, null, XValue: f, Ch1ThdNPercent: thdPct, Ch1ThdNDb: thdDb, IsValid: thdValid));
-        }
-
-        return (h2List, h3List, thdList);
     }
 
     // 简化的虚拟入口默认分析通道 1，得到的增益和延迟来自软件 DUT 的输入、输出样本。
@@ -802,7 +903,7 @@ public static class ContinuousSweepAnalyzer
     private static List<FrequencyResponsePoint> ExtractResponsePointsFromSpectrum(
         Complex[] hSpec, int sampleRate, double startHz, double stopHz, int pointCount, double excitationLevelDbfs,
         double gainOffsetDb, ContinuousPhaseMode? phaseMode = null, int delaySamples = 0,
-        Func<int, double>? measuredMagnitude = null, double[]? requestedFrequencies = null)
+        Func<int, double>? measuredMagnitude = null, double[]? requestedFrequencies = null, bool alreadyPeakAligned = false)
     {
         // 先建立输出频率网格，再让幅度、相位和相对参考共用它，确保同一行各列对应同一物理频率。
         int fftSize = hSpec.Length;
@@ -811,7 +912,7 @@ public static class ContinuousSweepAnalyzer
             Math.Max(10.0, startHz), stopHz, Math.Clamp(pointCount, 20, 4096)));
         if (requestedFrequencies == null) freqs[^1] = stopHz;
         var phases = phaseMode is { } mode
-            ? ExtractChirpPhases(hSpec, freqs, binHz, delaySamples, mode)
+            ? ExtractChirpPhases(hSpec, freqs, binHz, delaySamples, mode, alreadyPeakAligned)
             : null;
 
         var raw = new List<FrequencyResponsePoint>(freqs.Length);
@@ -840,16 +941,16 @@ public static class ContinuousSweepAnalyzer
     }
 
     private static double[] ExtractChirpPhases(
-        Complex[] spectrum, double[] frequencies, double binHz, int delaySamples, ContinuousPhaseMode mode)
+        Complex[] spectrum, double[] frequencies, double binHz, int delaySamples, ContinuousPhaseMode mode, bool alreadyPeakAligned = false)
     {
         // 纯延时给出与频率成正比的相位斜率。先按脉冲峰延时对齐，再沿相邻频点连续展开，可避免跨越 ±180° 时错误地平均到 0°。
         double delayDegreesPerBin = 360.0 * delaySamples / spectrum.Length;
         int lastBin = spectrum.Length / 2 - 1;
         // 定位目标频率下方的频格，预留上方一格供相位插值。
         int BinBelow(double frequency) => Math.Clamp((int)Math.Floor(frequency / binHz), 1, lastBin - 1);
-        // 先加上与整采样时延相反的线性相位，以脉冲峰为时间参考；插值后按显示模式决定是否恢复原时间参考。
+        // 若频谱尚未围绕主峰对齐，先加上与整采样时延相反的线性相位；已对齐的频谱直接取相角。
         double PhaseWithPeakAligned(int bin) => FrequencyResponseSweeper.NormalizeAngleDeg(
-            spectrum[bin].Phase * (180.0 / Math.PI) + bin * delayDegreesPerBin);
+            spectrum[bin].Phase * (180.0 / Math.PI) + (alreadyPeakAligned ? 0.0 : bin * delayDegreesPerBin));
 
         var result = new double[frequencies.Length];
         bool unwrap = mode is ContinuousPhaseMode.Unwrapped or ContinuousPhaseMode.RelativeToCh1 or ContinuousPhaseMode.Excess;
@@ -889,4 +990,45 @@ public static class ContinuousSweepAnalyzer
 
     // 上取整到 2 的幂，使补零后的缓冲既容纳所需样本数，又能交给基二 FFT。
     private static int NextPowerOfTwo(int v) { int p = 1; while (p < v) p <<= 1; return p; }
+
+    /// <summary>
+    /// 对齐 APx500 信号路径输入滤波（High-Pass 含 AC &lt;10 Hz 交流耦合、Low-Pass、Weighting）：
+    /// 沿连续采集波形就地运行，使连续扫描与实时仪表共享完全一致的输入滤波链路。
+    /// </summary>
+    public static void ApplySignalPathFilters(double[] samples, int sampleRate, AnalyzerFilterConfig filter, bool channel2)
+    {
+        if (samples.Length == 0 || sampleRate <= 0) return;
+        bool hpOn = channel2 ? filter.Ch2HighPassEnabled : filter.Ch1HighPassEnabled;
+        bool lpOn = channel2 ? filter.Ch2LowPassEnabled : filter.Ch1LowPassEnabled;
+        bool wtOn = channel2 ? filter.Ch2WeightingEnabled : filter.Ch1WeightingEnabled;
+
+        if (hpOn && filter.HighPassHz > 0.0)
+        {
+            if (Math.Abs(filter.HighPassHz - 10.0) < 0.05 && filter.HighPassType == HighPassFilterType.Butterworth4)
+            {
+                // 对齐 APx500 Bench Mode AC (<10 Hz)：直接沿连续采集流运行 ApxAcCouplingFilter；
+                // 不对前段信号盲估 DC（避免在短前导输入中把 20 Hz 正弦首半周误当直流预充）。
+                new ApxAcCouplingFilter(sampleRate).Process(samples, samples);
+            }
+            else
+            {
+                var hp = filter.HighPassType == HighPassFilterType.Elliptic5
+                    ? ApxEllipticLowPass.CreateEllipticHighPassStereo(filter.HighPassHz, sampleRate).Left
+                    : StreamingIirCascade.CreateButterworthHighPass(4, filter.HighPassHz, sampleRate);
+                hp.ProcessInPlace(samples);
+            }
+        }
+        if (lpOn && filter.LowPassHz > 0.0)
+        {
+            var lp = filter.LowPassType is LowPassFilterType.Aes17 or LowPassFilterType.Elliptic8
+                ? ApxEllipticLowPass.CreateStereo(ApxEllipticLowPass.RelativeCutoff(filter.LowPassHz, sampleRate), sampleRate).Left
+                : StreamingIirCascade.CreateButterworthLowPass(8, filter.LowPassHz, sampleRate);
+            lp.ProcessInPlace(samples);
+        }
+        if (wtOn && filter.Weighting != AnalyzerWeighting.Flat)
+        {
+            var wt = ApxAnsiWeighting.Create(filter.Weighting, sampleRate);
+            wt.ProcessInPlace(samples);
+        }
+    }
 }

@@ -72,7 +72,7 @@ internal static class SequenceTransform
     // 各种窗展宽一根纯音谱线的程度不同；该表以频格为单位给出后续峰带积分的半宽。
     internal static int HalfWidth(FftWindowType window) => window switch
     {
-        FftWindowType.Rectangular => 1,
+        FftWindowType.Rectangular or FftWindowType.NoneMoveToBinCenter => 1,
         FftWindowType.Hann or FftWindowType.BlackmanHarris => 3,
         FftWindowType.BlackmanHarris4 => 4,
         FftWindowType.FlatTop or FftWindowType.Dolph150 => 5,

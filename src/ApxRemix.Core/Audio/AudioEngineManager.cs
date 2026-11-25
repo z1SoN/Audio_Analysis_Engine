@@ -105,6 +105,12 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
     private ApxStreamingPhaseMeter? _streamingPhaseMeter;
     private StreamingBenchPipeline? _streamingBenchPipeline;
     private StreamingBenchPipeline? _panelMeters;
+    private StreamingBenchPipeline? _recorderMeters;
+    private Func<AudioCaptureSnapshot, bool>? _publishRecorderFrame;
+    private Action<Exception?>? _completeRecorderFrames;
+    private double _recorderReadingRateHz;
+    private long _recorderMeterStart, _recorderDeliveredEnd;
+    private bool _scanRecorderInput;
     public bool CapturePanelReadings { get; init; }
     private AnalyzerFilterConfig _liveAnalyzerFilter = new();
     private AnalyzerFilterConfig _panelFilter = new();
@@ -158,7 +164,10 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
 
     private SignalPathEqualizer _inputEqualizer = new();
     private SignalPathConfig? _capturePath;
-    public void Start(SignalPathConfig pathConfig, GeneratorConfig generatorConfig)
+    public void Start(SignalPathConfig pathConfig, GeneratorConfig generatorConfig) =>
+        Start(pathConfig, generatorConfig, null);
+
+    public void Start(SignalPathConfig pathConfig, GeneratorConfig generatorConfig, Action? beforeInput)
     {
         // 虚拟 DUT 需要成对的模拟输入与输出，并由调用方显式启用。
         AudioOutputConnector output = pathConfig.EffectiveOutput;
@@ -194,7 +203,11 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
         };
         _activeEngine.AudioBlockCaptured += OnEngineBlockCaptured;
         _activeEngine.EngineStateChanged += OnEngineStateChanged;
-        try { _activeEngine.Start(pathConfig, generatorConfig); }
+        try
+        {
+            beforeInput?.Invoke();
+            _activeEngine.Start(pathConfig, generatorConfig);
+        }
         catch { Stop(); throw; }
     }
 
@@ -221,6 +234,7 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
     public void Stop()
     {
         StopRawWavRecording();
+        CloseRecorderCapture(new InvalidOperationException("Acquisition stopped."));
         if (_activeEngine is not null)
         {
             // 先解除事件订阅，再停止并释放旧引擎。下次 Start 建立的是新会话，旧回调不应继续推进新会话的读数。
@@ -251,6 +265,7 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
             _liveGeneratorFreqHz = config.FrequencyHz;
             _streamingBenchPipeline?.Configure(_liveAnalyzerFilter, _liveCh1GainDb, _liveCh2GainDb, _liveGeneratorFreqHz);
             _panelMeters?.Configure(_panelFilter, _liveCh1GainDb, _liveCh2GainDb, _liveGeneratorFreqHz);
+            _recorderMeters?.Configure(_panelFilter, _liveCh1GainDb, _liveCh2GainDb, _liveGeneratorFreqHz);
         }
         _activeEngine?.UpdateGenerator(config);
     }
@@ -284,6 +299,62 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
             if (generatorFreqHz is double frequency) _liveGeneratorFreqHz = frequency;
             _streamingBenchPipeline?.Configure(_liveAnalyzerFilter, _liveCh1GainDb, _liveCh2GainDb, _liveGeneratorFreqHz);
             _panelMeters?.Configure(_panelFilter, _liveCh1GainDb, _liveCh2GainDb, _liveGeneratorFreqHz);
+            _recorderMeters?.Configure(_panelFilter, _liveCh1GainDb, _liveCh2GainDb, _liveGeneratorFreqHz);
+        }
+    }
+
+    /// <summary>向实时连续 Bench 链推送 APxRT 双二阶输入 EQ 级联系数。</summary>
+    public void SetRealtimeInputEq(int order, double[] a1, double[] a2,
+        double[] b1, double[] b2, double gain, int slot, bool on1, bool on2)
+    {
+        lock (_ringLock)
+        {
+            _streamingBenchPipeline?.SetEqFilter(order, a1, a2, b1, b2, gain, slot, on1, on2);
+            _panelMeters?.SetEqFilter(order, a1, a2, b1, b2, gain, slot, on1, on2);
+            _recorderMeters?.SetEqFilter(order, a1, a2, b1, b2, gain, slot, on1, on2);
+        }
+    }
+
+    public long BeginRecorderCapture(double readingRateHz, bool scanInput,
+        Func<AudioCaptureSnapshot, bool> publish, Action<Exception?> complete)
+    {
+        lock (_ringLock)
+        {
+            _recorderMeters = null;
+            _recorderReadingRateHz = readingRateHz;
+            _recorderDeliveredEnd = _totalSamplesCaptured;
+            _scanRecorderInput = scanInput;
+            _publishRecorderFrame = publish;
+            _completeRecorderFrames = complete;
+            if (_activeEngine?.HasReachedEof == true) CloseRecorderCapture(null);
+            return _totalSamplesCaptured;
+        }
+    }
+
+    public void SetRecorderReadingRate(double readingRateHz)
+    {
+        lock (_ringLock)
+        {
+            _recorderReadingRateHz = readingRateHz;
+            _recorderMeters?.SetRecorderReadingRate(readingRateHz);
+        }
+    }
+
+    public void StopRecorderTriggerScan()
+    {
+        lock (_ringLock) _scanRecorderInput = false;
+    }
+
+    public void EndRecorderCapture() => CloseRecorderCapture(null);
+
+    private void CloseRecorderCapture(Exception? error)
+    {
+        lock (_ringLock)
+        {
+            _completeRecorderFrames?.Invoke(error);
+            _completeRecorderFrames = null;
+            _publishRecorderFrame = null;
+            _recorderMeters = null;
         }
     }
 
@@ -347,43 +418,46 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
     public AudioCaptureSnapshot CaptureLatestSnapshotWithMeta(int sampleCount)
     {
         lock (_ringLock)
+            return CaptureSnapshotAt(sampleCount, _totalSamplesCaptured, ActualSampleRate);
+    }
+
+    private AudioCaptureSnapshot CaptureSnapshotAt(int sampleCount, long endSample, int sampleRate)
+    {
+        // A Recorder report can land inside the most recent driver callback.
+        int trailing = (int)Math.Clamp(_totalSamplesCaptured - endSample, 0, RingCapacity);
+        int count = Math.Clamp(sampleCount, 0, Math.Max(0, _validSampleCount - trailing));
+        if (count <= 0)
         {
-            // 请求长度受已写入的有效样本和缓冲容量共同约束。还没收到样本时，空波形也带会话信息。
-            int count = Math.Min(Math.Min(Math.Max(0, sampleCount), _validSampleCount), RingCapacity);
-            if (count <= 0)
-            {
-                return new AudioCaptureSnapshot(
-                    Array.Empty<double>(), Array.Empty<double>(), null,
-                    _totalSamplesCaptured, ActualSampleRate, IsRunning, _hasIndependentDualChannels);
-            }
-
-            var left = new double[count];
-            var right = new double[count];
-            double[]? syncRef = _hasSyncReference ? new double[count] : null;
-
-            // 向写指针之前回看 count 个样本。若窗口跨过数组末尾，下面分两次复制，把它重新排成按时间从早到晚的一段，供 FFT 或屏幕取用。
-            int start = (_writeCursor - count + RingCapacity) % RingCapacity;
-            int firstPart = Math.Min(count, RingCapacity - start);
-            int secondPart = count - firstPart;
-
-            Array.Copy(_ringLeft, start, left, 0, firstPart);
-            Array.Copy(_ringRight, start, right, 0, firstPart);
-            if (syncRef is not null) Array.Copy(_ringSyncRef, start, syncRef, 0, firstPart);
-
-            if (secondPart > 0)
-            {
-                Array.Copy(_ringLeft, 0, left, firstPart, secondPart);
-                Array.Copy(_ringRight, 0, right, firstPart, secondPart);
-                if (syncRef is not null) Array.Copy(_ringSyncRef, 0, syncRef, firstPart, secondPart);
-            }
-
             return new AudioCaptureSnapshot(
-                // 快照一并返回最新时域窗口与最近发布的仪表结果。它们的更新周期各自独立，仪表处理窗口可能早于最新样本。
-                left, right, syncRef, _totalSamplesCaptured, ActualSampleRate, IsRunning,
-                _hasIndependentDualChannels, _streamingPhaseMeter?.Latest, _streamingBenchPipeline?.Latest,
-                _generatorFileStarts.Count == 0 ? null : _generatorFileStarts.Where(i => i >= _totalSamplesCaptured - count).ToArray(), _digitalWords?.Reading)
-                { PanelReading = _panelMeters?.Latest };
+                Array.Empty<double>(), Array.Empty<double>(), null,
+                endSample, sampleRate, IsRunning, _hasIndependentDualChannels);
         }
+
+        var left = new double[count];
+        var right = new double[count];
+        double[]? syncRef = _hasSyncReference ? new double[count] : null;
+
+        // 若窗口跨过数组末尾，分两次复制，将样本按时间从早到晚交付。
+        int start = (_writeCursor - trailing - count + RingCapacity) % RingCapacity;
+        int firstPart = Math.Min(count, RingCapacity - start);
+        int secondPart = count - firstPart;
+
+        Array.Copy(_ringLeft, start, left, 0, firstPart);
+        Array.Copy(_ringRight, start, right, 0, firstPart);
+        if (syncRef is not null) Array.Copy(_ringSyncRef, start, syncRef, 0, firstPart);
+
+        if (secondPart > 0)
+        {
+            Array.Copy(_ringLeft, 0, left, firstPart, secondPart);
+            Array.Copy(_ringRight, 0, right, firstPart, secondPart);
+            if (syncRef is not null) Array.Copy(_ringSyncRef, 0, syncRef, firstPart, secondPart);
+        }
+
+        return new AudioCaptureSnapshot(
+            left, right, syncRef, endSample, sampleRate, IsRunning,
+            _hasIndependentDualChannels, _streamingPhaseMeter?.Latest, _streamingBenchPipeline?.Latest,
+            _generatorFileStarts.Count == 0 ? null : _generatorFileStarts.Where(i => i >= endSample - count && i < endSample).ToArray(), _digitalWords?.Reading)
+            { PanelReading = _panelMeters?.Latest };
     }
 
     public void ClearBuffer()
@@ -410,9 +484,27 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
     private void OnEngineStateChanged(string status)
     {
         lock (_ringLock)
-            // WAV 正常读完时，告知面板检测器输入已经结束，以便完成最后一段处理。
-            if (_activeEngine?.HasReachedEof == true) _panelMeters?.CompleteInput();
+        {
+            if (_activeEngine?.HasReachedEof == true)
+            {
+                _panelMeters?.CompleteInput();
+                _recorderMeters?.CompleteInput(PublishRecorderReading);
+                CloseRecorderCapture(null);
+            }
+            else if (_activeEngine?.IsRunning == false)
+                CloseRecorderCapture(new InvalidOperationException("Acquisition stopped."));
+        }
         EngineStateChanged?.Invoke(status);
+    }
+
+    private void PublishRecorderReading(StreamingBenchReading reading)
+    {
+        long end = _recorderMeterStart + reading.EndSampleIndex;
+        int waveformLength = Math.Clamp(reading.ReportSampleCount, 256, 16384);
+        if (_scanRecorderInput)
+            waveformLength = (int)Math.Min(RingCapacity, Math.Max(waveformLength, end - _recorderDeliveredEnd));
+        var frame = CaptureSnapshotAt(waveformLength, end, reading.SampleRate) with { BenchReading = reading };
+        if (_publishRecorderFrame?.Invoke(frame) == true) _recorderDeliveredEnd = end;
     }
 
     // 从声卡跟读一次测量，可以把断点放在这里。ASIO 路径上，AsioPcmFormat.Decode 已把
@@ -487,6 +579,22 @@ public sealed class AudioEngineManager(bool useVirtualFixture = false) : IDispos
                         _panelMeters.Configure(_panelFilter, _liveCh1GainDb, _liveCh2GainDb, _liveGeneratorFreqHz);
                     }
                     _panelMeters.Process(block.Left.AsSpan(0, len), block.Right.AsSpan(0, len));
+                }
+                if (_publishRecorderFrame is not null)
+                {
+                    if (_recorderMeters?.SampleRate != block.SampleRate)
+                    {
+                        _recorderMeterStart = _totalSamplesCaptured - len;
+                        _recorderMeters = StreamingBenchPipeline.ForRecorder(block.SampleRate, _panelFilter, _recorderReadingRateHz);
+                        _recorderMeters.Configure(_panelFilter, _liveCh1GainDb, _liveCh2GainDb, _liveGeneratorFreqHz);
+                    }
+                    _recorderMeters.Process(block.Left.AsSpan(0, len), block.Right.AsSpan(0, len), PublishRecorderReading);
+                    if (_scanRecorderInput && _recorderDeliveredEnd < _totalSamplesCaptured)
+                    {
+                        int scanLength = (int)Math.Min(RingCapacity, _totalSamplesCaptured - _recorderDeliveredEnd);
+                        var scan = CaptureSnapshotAt(scanLength, _totalSamplesCaptured, block.SampleRate) with { BenchReading = null };
+                        if (_publishRecorderFrame.Invoke(scan)) _recorderDeliveredEnd = _totalSamplesCaptured;
+                    }
                 }
             }
         }
